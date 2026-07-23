@@ -1,0 +1,24 @@
+# Private local state: cloned-voice profiles, reference audio metadata, and history
+/data/
+
+# Generated desktop packages and local build output
+/build/bin/
+/build/superseded/
+/build/*.exe
+/build/appicon.png
+
+# JavaScript build and installed dependencies
+/frontend/node_modules/
+/frontend/dist/
+/frontend/package.json.md5
+
+# Local Go build caches and test artifacts
+/.gocache/
+/.gomodcache/
+*.test
+*.prof
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.vscode/

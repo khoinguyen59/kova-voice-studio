@@ -1,0 +1,19 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="surface" x1="184" y1="138" x2="854" y2="884" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3B9BFF"/>
+      <stop offset=".53" stop-color="#187CF0"/>
+      <stop offset="1" stop-color="#09C9DC"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="300" y1="260" x2="770" y2="770" gradientUnits="userSpaceOnUse">
+      <stop stop-color="white" stop-opacity=".22"/>
+      <stop offset="1" stop-color="white" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="248" fill="url(#surface)"/>
+  <rect x="58" y="58" width="908" height="908" rx="202" stroke="white" stroke-opacity=".16" stroke-width="20"/>
+  <path d="M347 274V750" stroke="white" stroke-width="88" stroke-linecap="round"/>
+  <path d="M408 512L708 285" stroke="white" stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M408 512L708 739" stroke="white" stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M128 218C249 111 425 76 574 116C689 147 785 214 867 312" stroke="url(#sheen)" stroke-width="70" stroke-linecap="round"/>
+</svg>
