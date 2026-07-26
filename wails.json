@@ -7,5 +7,15 @@
   "frontend:build": "npm run build",
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
-  "author": { "name": "KOVA", "email": "" }
+  "author": { "name": "KOVA", "email": "" },
+  "postBuildHooks": {
+    "windows/amd64": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../../scripts/package-windows.ps1 ${bin}"
+  },
+  "info": {
+    "companyName": "KOVA",
+    "productName": "KOVA Voice Studio",
+    "productVersion": "1.0.1.8",
+    "copyright": "Copyright (c) 2026 KOVA",
+    "comments": "Private desktop client for a user-controlled KOVA Voice Studio worker."
+  }
 }

@@ -24,6 +24,48 @@ export namespace main {
 	        this.sample = source["sample"];
 	    }
 	}
+	export class EmotionPreset {
+	    id: string;
+	    label_vi: string;
+	    label_en: string;
+	    instruct: string;
+	    tokens: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new EmotionPreset(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.label_vi = source["label_vi"];
+	        this.label_en = source["label_en"];
+	        this.instruct = source["instruct"];
+	        this.tokens = source["tokens"];
+	    }
+	}
+	export class EmotionTextRequest {
+	    gateway_url: string;
+	    api_key: string;
+	    model: string;
+	    text: string;
+	    language: string;
+	    emotion_id: string;
+
+	    static createFrom(source: any = {}) {
+	        return new EmotionTextRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.gateway_url = source["gateway_url"];
+	        this.api_key = source["api_key"];
+	        this.model = source["model"];
+	        this.text = source["text"];
+	        this.language = source["language"];
+	        this.emotion_id = source["emotion_id"];
+	    }
+	}
 	export class GatewayModel {
 	    id: string;
 	    name: string;
@@ -64,6 +106,7 @@ export namespace main {
 	    language: string;
 	    speed: number;
 	    steps: number;
+	    style_prompt: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new GenerateRequest(source);
@@ -78,6 +121,7 @@ export namespace main {
 	        this.language = source["language"];
 	        this.speed = source["speed"];
 	        this.steps = source["steps"];
+	        this.style_prompt = source["style_prompt"];
 	    }
 	}
 	export class GenerationHistory {
@@ -87,6 +131,7 @@ export namespace main {
 	    text: string;
 	    language: string;
 	    file_name: string;
+	    storage_dir?: string;
 	    created_at: string;
 	    size_bytes: number;
 	
@@ -102,6 +147,7 @@ export namespace main {
 	        this.text = source["text"];
 	        this.language = source["language"];
 	        this.file_name = source["file_name"];
+	        this.storage_dir = source["storage_dir"];
 	        this.created_at = source["created_at"];
 	        this.size_bytes = source["size_bytes"];
 	    }
@@ -156,26 +202,11 @@ export namespace main {
 	        this.characters = source["characters"];
 	    }
 	}
-	export class PairingSession {
-	    worker_url: string;
-	    token: string;
-	    message: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new PairingSession(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.worker_url = source["worker_url"];
-	        this.token = source["token"];
-	        this.message = source["message"];
-	    }
-	}
 	export class PreferencesRequest {
 	    theme: string;
 	    locale: string;
 	    worker_url: string;
+	    audio_output_dir: string;
 	    selected_voice_id: string;
 	
 	    static createFrom(source: any = {}) {
@@ -187,7 +218,28 @@ export namespace main {
 	        this.theme = source["theme"];
 	        this.locale = source["locale"];
 	        this.worker_url = source["worker_url"];
+	        this.audio_output_dir = source["audio_output_dir"];
 	        this.selected_voice_id = source["selected_voice_id"];
+	    }
+	}
+	export class ReferenceTranscriptRequest {
+	    base_url: string;
+	    token: string;
+	    reference_path: string;
+	    reference_data_url: string;
+	    language: string;
+
+	    static createFrom(source: any = {}) {
+	        return new ReferenceTranscriptRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.base_url = source["base_url"];
+	        this.token = source["token"];
+	        this.reference_path = source["reference_path"];
+	        this.reference_data_url = source["reference_data_url"];
+	        this.language = source["language"];
 	    }
 	}
 	export class VoiceProfile {
@@ -202,6 +254,7 @@ export namespace main {
 	    worker_url?: string;
 	    created_at: string;
 	    reference_clean: boolean;
+	    reference_text?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new VoiceProfile(source);
@@ -220,6 +273,7 @@ export namespace main {
 	        this.worker_url = source["worker_url"];
 	        this.created_at = source["created_at"];
 	        this.reference_clean = source["reference_clean"];
+	        this.reference_text = source["reference_text"];
 	    }
 	}
 	export class StudioBootstrap {
@@ -229,10 +283,12 @@ export namespace main {
 	    theme: string;
 	    locale: string;
 	    worker_url: string;
+	    audio_output_dir: string;
 	    selected_voice_id: string;
 	    voices: VoiceProfile[];
 	    history: GenerationHistory[];
 	    demo_voices: DemoVoice[];
+	    emotion_presets: EmotionPreset[];
 	
 	    static createFrom(source: any = {}) {
 	        return new StudioBootstrap(source);
@@ -246,10 +302,12 @@ export namespace main {
 	        this.theme = source["theme"];
 	        this.locale = source["locale"];
 	        this.worker_url = source["worker_url"];
+	        this.audio_output_dir = source["audio_output_dir"];
 	        this.selected_voice_id = source["selected_voice_id"];
 	        this.voices = this.convertValues(source["voices"], VoiceProfile);
 	        this.history = this.convertValues(source["history"], GenerationHistory);
 	        this.demo_voices = this.convertValues(source["demo_voices"], DemoVoice);
+	        this.emotion_presets = this.convertValues(source["emotion_presets"], EmotionPreset);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -314,6 +372,7 @@ export namespace main {
 	    name: string;
 	    language: string;
 	    reference_path: string;
+	    reference_text: string;
 	    consent_confirmed: boolean;
 	
 	    static createFrom(source: any = {}) {
@@ -327,30 +386,7 @@ export namespace main {
 	        this.name = source["name"];
 	        this.language = source["language"];
 	        this.reference_path = source["reference_path"];
-	        this.consent_confirmed = source["consent_confirmed"];
-	    }
-	}
-	export class VoiceDropCreateRequest {
-	    base_url: string;
-	    token: string;
-	    name: string;
-	    language: string;
-	    reference_base64: string;
-	    reference_name: string;
-	    consent_confirmed: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new VoiceDropCreateRequest(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.base_url = source["base_url"];
-	        this.token = source["token"];
-	        this.name = source["name"];
-	        this.language = source["language"];
-	        this.reference_base64 = source["reference_base64"];
-	        this.reference_name = source["reference_name"];
+	        this.reference_text = source["reference_text"];
 	        this.consent_confirmed = source["consent_confirmed"];
 	    }
 	}
@@ -387,4 +423,3 @@ export namespace main {
 	}
 
 }
-

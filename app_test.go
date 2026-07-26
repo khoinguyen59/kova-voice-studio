@@ -5,13 +5,60 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestApplicationVersionUsesKovaReleaseFormat(t *testing.T) {
+	parts := strings.Split(applicationVersion, ".")
+	if len(parts) != 4 {
+		t.Fatalf("application version must have four numeric parts, got %q", applicationVersion)
+	}
+	for _, part := range parts {
+		if _, err := strconv.Atoi(part); err != nil {
+			t.Fatalf("application version has a non-numeric component: %q", applicationVersion)
+		}
+	}
+	build, err := strconv.Atoi(parts[3])
+	if err != nil || build < 0 || build > 9 {
+		t.Fatalf("fourth version component must be 0 through 9, got %q", applicationVersion)
+	}
+}
+
+func TestRequestContextRemainsActiveWhileResponseBodyIsRead(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "audio/wav")
+		response.WriteHeader(http.StatusOK)
+		response.(http.Flusher).Flush()
+		time.Sleep(75 * time.Millisecond)
+		_, _ = response.Write([]byte("RIFF-delayed-audio"))
+	}))
+	defer server.Close()
+
+	app := NewApp()
+	app.client = server.Client()
+	request, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := app.do(request, time.Second)
+	if err != nil {
+		t.Fatalf("start request: %v", err)
+	}
+	defer response.Body.Close()
+	audio, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read delayed response body: %v", err)
+	}
+	if string(audio) != "RIFF-delayed-audio" {
+		t.Fatalf("unexpected delayed audio body: %q", audio)
+	}
+}
 
 func TestCloneProfilePersistsReferenceAndRestoresAfterRestart(t *testing.T) {
 	dataDir := t.TempDir()
@@ -71,6 +118,7 @@ func TestCloneProfilePersistsReferenceAndRestoresAfterRestart(t *testing.T) {
 		Name:             "Lan da luu",
 		Language:         "vi",
 		ReferencePath:    reference,
+		ReferenceText:    "Xin chào, đây là đoạn mẫu của Lan.",
 		ConsentConfirmed: true,
 	})
 	if err != nil {
@@ -87,7 +135,7 @@ func TestCloneProfilePersistsReferenceAndRestoresAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(stateBytes), `"reference_file"`) {
+	if !strings.Contains(string(stateBytes), `"reference_file"`) || !strings.Contains(string(stateBytes), `"reference_text"`) {
 		t.Fatal("persistent state does not contain the reference backup filename")
 	}
 	if strings.Contains(string(stateBytes), "session-only-token") {
@@ -136,6 +184,72 @@ func TestCloneProfilePersistsReferenceAndRestoresAfterRestart(t *testing.T) {
 	}
 }
 
+func TestCreateVoiceRequiresUserReviewedReferenceTranscript(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("KOVA_VOICE_STUDIO_DATA_DIR", dataDir)
+	reference := filepath.Join(dataDir, "speaker.wav")
+	if err := os.WriteFile(reference, []byte("reference-audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp()
+	_, err := app.CreateVoice(VoiceCreateRequest{
+		WorkerSession: WorkerSession{BaseURL: "https://worker.example", Token: "session-token"},
+		Name:          "Reviewed voice", Language: "vi", ReferencePath: reference, ConsentConfirmed: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "transcript") {
+		t.Fatalf("expected transcript validation error, got %v", err)
+	}
+}
+
+func TestEmotionPresetsExposeOnlyRecognizedTokens(t *testing.T) {
+	allowed := map[string]bool{
+		"[laughter]": true, "[sigh]": true, "[confirmation-en]": true,
+		"[question-en]": true, "[question-ah]": true, "[question-oh]": true, "[question-ei]": true, "[question-yi]": true,
+		"[surprise-ah]": true, "[surprise-oh]": true, "[surprise-wa]": true, "[surprise-yo]": true, "[dissatisfaction-hnn]": true,
+	}
+	for _, preset := range emotionPresets() {
+		for _, token := range preset.Tokens {
+			if !allowed[token] {
+				t.Fatalf("preset %s exposes an unrecognized token %q", preset.ID, token)
+			}
+		}
+	}
+}
+
+func TestAutoTranscribeReferenceReturnsAnEditableDraft(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("KOVA_VOICE_STUDIO_DATA_DIR", dataDir)
+	reference := filepath.Join(dataDir, "speaker.wav")
+	if err := os.WriteFile(reference, []byte("reference-audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/transcribe-reference" || request.Header.Get("Authorization") != "Bearer session-token" {
+			http.Error(response, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		if err := request.ParseMultipartForm(maxReferenceBytes); err != nil || request.FormValue("language") != "vi" {
+			http.Error(response, "invalid multipart body", http.StatusBadRequest)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"text":"Đây là transcript nháp."}`))
+	}))
+	defer server.Close()
+	app := NewApp()
+	app.client = server.Client()
+	draft, err := app.AutoTranscribeReference(ReferenceTranscriptRequest{
+		WorkerSession: WorkerSession{BaseURL: server.URL, Token: "session-token"},
+		ReferencePath: reference, Language: "vi",
+	})
+	if err != nil {
+		t.Fatalf("auto transcribe reference: %v", err)
+	}
+	if draft != "Đây là transcript nháp." {
+		t.Fatalf("unexpected transcript draft: %q", draft)
+	}
+}
+
 func TestMissingReferenceIsReportedAsUnavailableWithoutLosingProfile(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("KOVA_VOICE_STUDIO_DATA_DIR", dataDir)
@@ -180,6 +294,94 @@ func TestBootstrapReturnsEmptyArraysInsteadOfNull(t *testing.T) {
 	}
 	if strings.Contains(string(serialized), `"voices":null`) || strings.Contains(string(serialized), `"history":null`) {
 		t.Fatalf("bootstrap JSON must not contain null collections: %s", serialized)
+	}
+}
+
+func TestReadVoiceReferenceAudioUsesPrivateBackupWithoutWorker(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("KOVA_VOICE_STUDIO_DATA_DIR", dataDir)
+	if err := os.MkdirAll(filepath.Join(dataDir, "references"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "references", "sample.wav"), []byte("RIFF-local-reference"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	state := studioState{Version: 1, Theme: "light", Locale: "vi", Voices: []VoiceProfile{{
+		ID: "saved-profile", Name: "Local sample", Language: "vi", ReferenceFile: "sample.wav", BackupAvailable: true,
+	}}}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "studio-state.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	dataURL, err := NewApp().ReadVoiceReferenceAudio("saved-profile")
+	if err != nil {
+		t.Fatalf("read local reference: %v", err)
+	}
+	if !strings.HasPrefix(dataURL, "data:audio/") || !strings.Contains(dataURL, ";base64,") {
+		t.Fatalf("expected browser-playable local audio URL, got %q", dataURL)
+	}
+}
+
+func TestGeneratedAudioUsesSelectedOutputFolderAndKeepsItsLocation(t *testing.T) {
+	dataDir := t.TempDir()
+	outputDir := t.TempDir()
+	t.Setenv("KOVA_VOICE_STUDIO_DATA_DIR", dataDir)
+	state := studioState{Version: 1, Theme: "light", Locale: "vi", Voices: []VoiceProfile{{
+		ID: "saved-profile", RemoteID: "worker-profile", Name: "Saved voice", Language: "vi", Status: "ready",
+	}}}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "studio-state.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/voices":
+			response.Header().Set("Content-Type", "application/json")
+			_, _ = response.Write([]byte(`[{"id":"worker-profile","name":"Saved voice","language":"vi","status":"ready"}]`))
+		case "/generate":
+			response.Header().Set("Content-Type", "audio/wav")
+			_, _ = response.Write([]byte("RIFF-generated-audio"))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	app := NewApp()
+	preferences, err := app.SavePreferences(PreferencesRequest{Theme: "light", Locale: "vi", AudioOutputDir: outputDir})
+	if err != nil {
+		t.Fatalf("save output preference: %v", err)
+	}
+	if preferences.AudioOutputDir != outputDir {
+		t.Fatalf("output folder was not persisted: %q", preferences.AudioOutputDir)
+	}
+	result, err := app.GenerateVoice(GenerateRequest{
+		WorkerSession: WorkerSession{BaseURL: server.URL, Token: "session-token"},
+		VoiceID:       "saved-profile", Text: "Save this in the selected folder", Language: "vi", Speed: 1, Steps: 8,
+	})
+	if err != nil {
+		t.Fatalf("generate audio: %v", err)
+	}
+	if result.History.StorageDir != outputDir {
+		t.Fatalf("history did not retain its selected folder: %#v", result.History)
+	}
+	path := filepath.Join(outputDir, result.History.FileName)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("generated audio was not saved to selected folder: %v", err)
+	}
+	if _, err := app.DeleteHistory(result.History.ID); err != nil {
+		t.Fatalf("delete external history: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("selected-folder audio was not deleted, stat error: %v", err)
 	}
 }
 
@@ -249,50 +451,57 @@ func TestGatewayModelCatalogDoesNotGuessPricing(t *testing.T) {
 	}
 }
 
-func TestOneTimeColabPairingIsConsumedWithoutPersistingToken(t *testing.T) {
-	dataDir := t.TempDir()
-	t.Setenv("KOVA_VOICE_STUDIO_DATA_DIR", dataDir)
-	const code = "abcdefghijklmnopqrstuvwxyz012345"
-	const token = "one-time-session-token"
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/v1/pairing/" + code:
-			response.Header().Set("Content-Type", "application/json")
-			_, _ = response.Write([]byte(`{"token":"` + token + `"}`))
-		case "/v1/health":
-			if request.Header.Get("Authorization") != "Bearer "+token {
-				http.Error(response, "missing token", http.StatusUnauthorized)
-				return
+func TestGatewayPricingRequiresExplicitNumericZero(t *testing.T) {
+	tests := []struct {
+		name    string
+		pricing map[string]json.RawMessage
+		want    bool
+	}{
+		{
+			name:    "zero decimal strings",
+			pricing: map[string]json.RawMessage{"prompt": json.RawMessage(`"0.00000000"`), "completion": json.RawMessage(`"0"`)},
+			want:    true,
+		},
+		{
+			name:    "zero JSON numbers",
+			pricing: map[string]json.RawMessage{"prompt": json.RawMessage(`0`), "completion": json.RawMessage(`0e0`)},
+			want:    true,
+		},
+		{
+			name:    "non-zero decimal",
+			pricing: map[string]json.RawMessage{"prompt": json.RawMessage(`"0.000001"`), "completion": json.RawMessage(`"0"`)},
+			want:    false,
+		},
+		{
+			name:    "unparseable pricing",
+			pricing: map[string]json.RawMessage{"prompt": json.RawMessage(`"free"`)},
+			want:    false,
+		},
+		{
+			name:    "missing pricing",
+			pricing: map[string]json.RawMessage{},
+			want:    false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := gatewayPricingIsFree(test.pricing); got != test.want {
+				t.Fatalf("gatewayPricingIsFree(%v) = %v, want %v", test.pricing, got, test.want)
 			}
-			response.Header().Set("Content-Type", "application/json")
-			_, _ = response.Write([]byte(`{"device":"cuda"}`))
-		default:
-			http.NotFound(response, request)
-		}
-	}))
-	defer server.Close()
+		})
+	}
+}
 
-	pairing := "kova-voice-studio://pair?worker_url=" + url.QueryEscape(server.URL) + "&code=" + code
-	if err := storeIncomingPairing(pairing); err != nil {
-		t.Fatalf("store pairing link: %v", err)
+func TestNormalizeGatewayURLRequiresHTTPSOutsideLocalhost(t *testing.T) {
+	got, err := normalizeGatewayURL("https://gateway.example.test")
+	if err != nil || got != "https://gateway.example.test/v1" {
+		t.Fatalf("normalize HTTPS gateway = %q, %v", got, err)
 	}
-	app := NewApp()
-	app.client = server.Client()
-	pair, err := app.ConsumeIncomingColabPairing()
-	if err != nil {
-		t.Fatalf("consume pairing link: %v", err)
+	got, err = normalizeGatewayURL("http://localhost:8080/v1/")
+	if err != nil || got != "http://localhost:8080/v1" {
+		t.Fatalf("normalize local gateway = %q, %v", got, err)
 	}
-	if pair == nil || pair.WorkerURL != server.URL || pair.Token != token {
-		t.Fatalf("unexpected pairing result: %#v", pair)
-	}
-	if next, err := app.ConsumeIncomingColabPairing(); err != nil || next != nil {
-		t.Fatalf("pairing inbox should be empty after one consume: %#v, %v", next, err)
-	}
-	stateBytes, err := os.ReadFile(filepath.Join(dataDir, "studio-state.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(stateBytes), token) {
-		t.Fatal("pairing token must remain session-only and never be persisted")
+	if _, err := normalizeGatewayURL("http://gateway.example.test"); err == nil {
+		t.Fatal("remote HTTP gateway must be rejected")
 	}
 }

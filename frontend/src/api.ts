@@ -1,54 +1,55 @@
-export type VoiceProfile = {
-  id: string;
-  remote_id: string;
-  name: string;
-  language: string;
-  status: string;
-  kind: string;
-  backup_available: boolean;
-  worker_url?: string;
-  created_at: string;
-  reference_clean: boolean;
+import {
+  ApplyEmotionWithGateway as bridgeApplyEmotionWithGateway,
+	AutoTranscribeReference as bridgeAutoTranscribeReference,
+  Bootstrap as bridgeBootstrap,
+  CheckWorker as bridgeCheckWorker,
+  CreateVoice as bridgeCreateVoice,
+  DeleteHistory as bridgeDeleteHistory,
+  DeleteVoice as bridgeDeleteVoice,
+  GenerateVoice as bridgeGenerateVoice,
+  ImportGoogleDriveDocument as bridgeImportGoogleDriveDocument,
+  ImportTextDocument as bridgeImportTextDocument,
+  ListGatewayModels as bridgeListGatewayModels,
+  OpenColabNotebook as bridgeOpenColabNotebook,
+  OpenGoogleDrive as bridgeOpenGoogleDrive,
+  OpenHistoryAudio as bridgeOpenHistoryAudio,
+  PreviewVoice as bridgePreviewVoice,
+	ReadVoiceReferenceAudio as bridgeReadVoiceReferenceAudio,
+	ReadReferenceAudioSource as bridgeReadReferenceAudioSource,
+  RefreshVoiceLibrary as bridgeRefreshVoiceLibrary,
+  ReviewTextWithGateway as bridgeReviewTextWithGateway,
+	SaveTrimmedReferenceAudio as bridgeSaveTrimmedReferenceAudio,
+  SavePreferences as bridgeSavePreferences,
+	SelectAudioOutputDirectory as bridgeSelectAudioOutputDirectory,
+  SelectReferenceAudio as bridgeSelectReferenceAudio,
+  SelectTextDocument as bridgeSelectTextDocument,
+} from "../wailsjs/go/main/App";
+import type { main } from "../wailsjs/go/models";
+
+type Plain<T> = {
+  [Key in keyof T as T[Key] extends (...args: any[]) => any ? never : Key]: T[Key];
 };
-export type GenerationHistory = {
-  id: string;
-  voice_id: string;
-  voice_name: string;
-  text: string;
-  language: string;
-  file_name: string;
-  created_at: string;
-  size_bytes: number;
-};
-export type DemoVoice = {
-  id: string;
-  name: string;
-  language: string;
-  accent: string;
-  rate: number;
-  pitch: number;
-  sample: string;
-};
-export type Bootstrap = {
-  app_name: string;
-  version: string;
-  notebook_url: string;
-  theme: string;
+
+export type VoiceProfile = Plain<main.VoiceProfile>;
+export type GenerationHistory = Plain<main.GenerationHistory>;
+export type DemoVoice = Plain<main.DemoVoice>;
+export type Bootstrap = Omit<Plain<main.StudioBootstrap>, "locale"> & {
   locale: "vi" | "en";
-  worker_url: string;
-  selected_voice_id: string;
-  voices: VoiceProfile[];
-  history: GenerationHistory[];
-  demo_voices: DemoVoice[];
 };
-export type Session = { base_url: string; token: string };
-export type Health = { reachable: boolean; message: string; device?: string };
-export type Generated = { history: GenerationHistory; data_url: string };
-export type PairingSession = {
-  worker_url: string;
-  token: string;
-  message: string;
-};
+export type Session = Plain<main.WorkerSession>;
+export type Health = Plain<main.WorkerHealth>;
+export type Generated = Plain<main.GenerationResult>;
+export type CreatePayload = Plain<main.VoiceCreateRequest>;
+export type GeneratePayload = Plain<main.GenerateRequest>;
+export type ImportedDocument = Plain<main.ImportedDocument>;
+export type TextReviewRequest = Plain<main.TextReviewRequest>;
+export type TextReviewResult = Plain<main.TextReviewResult>;
+export type GatewayModelsRequest = Plain<main.GatewayModelsRequest>;
+export type GatewayModel = Plain<main.GatewayModel>;
+export type EmotionPreset = Plain<main.EmotionPreset>;
+export type EmotionTextRequest = Plain<main.EmotionTextRequest>;
+export type ReferenceTranscriptRequest = Plain<main.ReferenceTranscriptRequest>;
+
 export type TaskProgress = {
   task: "clone" | "preview" | "generate";
   phase: string;
@@ -59,143 +60,114 @@ export type TaskProgress = {
   message: string;
   status: "running" | "complete" | "failed";
 };
-export type CreatePayload = Session & {
-  name: string;
-  language: string;
-  reference_path: string;
-  consent_confirmed: boolean;
-};
-export type DropPayload = Session & {
-  name: string;
-  language: string;
-  reference_base64: string;
-  reference_name: string;
-  consent_confirmed: boolean;
-};
-export type GeneratePayload = Session & {
-  voice_id: string;
-  text: string;
-  language: string;
-  speed: number;
-  steps: number;
-};
-export type ImportedDocument = {
-  file_name: string;
-  format: string;
-  text: string;
-  characters: number;
-};
-export type TextReviewRequest = {
-  gateway_url: string;
-  api_key: string;
-  model: string;
-  text: string;
-  language: string;
-  source_format: string;
-};
-export type TextReviewResult = {
-  revised_text: string;
-  review_summary: string;
-  warnings: string[];
-};
-export type GatewayModelsRequest = {
-  gateway_url: string;
-  api_key: string;
-};
-export type GatewayModel = {
-  id: string;
-  name: string;
-  free: boolean;
-  pricing_known: boolean;
-};
 
 declare global {
   interface Window {
-    go?: {
-      main?: {
-        App?: {
-          Bootstrap: () => Promise<Bootstrap>;
-          SavePreferences: (request: {
-            theme: string;
-            locale: string;
-            worker_url: string;
-            selected_voice_id: string;
-          }) => Promise<Bootstrap>;
-          OpenColabNotebook: () => Promise<void>;
-          OpenGoogleDrive: () => Promise<void>;
-          ConsumeIncomingColabPairing: () => Promise<PairingSession | null>;
-          CheckWorker: (session: Session) => Promise<Health>;
-          SelectReferenceAudio: () => Promise<string>;
-          SelectTextDocument: () => Promise<string>;
-          ImportTextDocument: (path: string) => Promise<ImportedDocument>;
-          ImportGoogleDriveDocument: (
-            sharedURL: string,
-          ) => Promise<ImportedDocument>;
-          ReviewTextWithGateway: (
-            request: TextReviewRequest,
-          ) => Promise<TextReviewResult>;
-          ListGatewayModels: (
-            request: GatewayModelsRequest,
-          ) => Promise<GatewayModel[]>;
-          RefreshVoiceLibrary: (session: Session) => Promise<VoiceProfile[]>;
-          CreateVoice: (request: CreatePayload) => Promise<VoiceProfile>;
-          CreateVoiceFromDrop: (request: DropPayload) => Promise<VoiceProfile>;
-          PreviewVoice: (request: GeneratePayload) => Promise<Generated>;
-          GenerateVoice: (request: GeneratePayload) => Promise<Generated>;
-          DeleteVoice: (
-            session: Session,
-            voiceID: string,
-          ) => Promise<VoiceProfile[]>;
-          DeleteHistory: (id: string) => Promise<GenerationHistory[]>;
-          OpenHistoryAudio: (id: string) => Promise<void>;
-        };
-      };
-    };
+    go?: { main?: { App?: unknown } };
   }
 }
 
 function desktop() {
-  const app = window.go?.main?.App;
-  if (!app)
+  if (!window.go?.main?.App) {
     throw new Error(
       "KOVA Voice Studio desktop bridge is unavailable. Open the desktop app, not a browser preview.",
     );
-  return app;
+  }
 }
 
-export const bootstrap = () => desktop().Bootstrap();
-export const savePreferences = (request: {
-  theme: string;
-  locale: string;
-  worker_url: string;
-  selected_voice_id: string;
-}) => desktop().SavePreferences(request);
-export const openColabNotebook = () => desktop().OpenColabNotebook();
-export const openGoogleDrive = () => desktop().OpenGoogleDrive();
-export const consumeIncomingColabPairing = () =>
-  desktop().ConsumeIncomingColabPairing();
-export const checkWorker = (session: Session) => desktop().CheckWorker(session);
-export const selectReferenceAudio = () => desktop().SelectReferenceAudio();
-export const selectTextDocument = () => desktop().SelectTextDocument();
-export const importTextDocument = (path: string) =>
-  desktop().ImportTextDocument(path);
-export const importGoogleDriveDocument = (sharedURL: string) =>
-  desktop().ImportGoogleDriveDocument(sharedURL);
-export const reviewTextWithGateway = (request: TextReviewRequest) =>
-  desktop().ReviewTextWithGateway(request);
-export const listGatewayModels = (request: GatewayModelsRequest) =>
-  desktop().ListGatewayModels(request);
-export const refreshVoiceLibrary = (session: Session) =>
-  desktop().RefreshVoiceLibrary(session);
-export const createVoice = (request: CreatePayload) =>
-  desktop().CreateVoice(request);
-export const createVoiceFromDrop = (request: DropPayload) =>
-  desktop().CreateVoiceFromDrop(request);
-export const previewVoice = (request: GeneratePayload) =>
-  desktop().PreviewVoice(request);
-export const generateVoice = (request: GeneratePayload) =>
-  desktop().GenerateVoice(request);
-export const deleteVoice = (session: Session, id: string) =>
-  desktop().DeleteVoice(session, id);
-export const deleteHistory = (id: string) => desktop().DeleteHistory(id);
-export const openHistoryAudio = (id: string) => desktop().OpenHistoryAudio(id);
+export const bootstrap = async (): Promise<Bootstrap> => {
+  desktop();
+  return (await bridgeBootstrap()) as Bootstrap;
+};
+export const savePreferences = async (request: main.PreferencesRequest) => {
+  desktop();
+  return (await bridgeSavePreferences(request)) as Bootstrap;
+};
+export const openColabNotebook = async () => {
+  desktop();
+  return bridgeOpenColabNotebook();
+};
+export const openGoogleDrive = async () => {
+  desktop();
+  return bridgeOpenGoogleDrive();
+};
+export const checkWorker = async (session: Session) => {
+  desktop();
+  return bridgeCheckWorker(session);
+};
+export const selectReferenceAudio = async () => {
+  desktop();
+  return bridgeSelectReferenceAudio();
+};
+export const selectAudioOutputDirectory = async () => {
+  desktop();
+  return bridgeSelectAudioOutputDirectory();
+};
+export const selectTextDocument = async () => {
+  desktop();
+  return bridgeSelectTextDocument();
+};
+export const importTextDocument = async (path: string) => {
+  desktop();
+  return bridgeImportTextDocument(path);
+};
+export const importGoogleDriveDocument = async (sharedURL: string) => {
+  desktop();
+  return bridgeImportGoogleDriveDocument(sharedURL);
+};
+export const reviewTextWithGateway = async (request: TextReviewRequest) => {
+  desktop();
+  return bridgeReviewTextWithGateway(request);
+};
+export const applyEmotionWithGateway = async (request: EmotionTextRequest) => {
+  desktop();
+  return bridgeApplyEmotionWithGateway(request);
+};
+export const autoTranscribeReference = async (request: ReferenceTranscriptRequest) => {
+  desktop();
+  return bridgeAutoTranscribeReference(request);
+};
+export const listGatewayModels = async (request: GatewayModelsRequest) => {
+  desktop();
+  return bridgeListGatewayModels(request);
+};
+export const refreshVoiceLibrary = async (session: Session) => {
+  desktop();
+  return bridgeRefreshVoiceLibrary(session);
+};
+export const createVoice = async (request: CreatePayload) => {
+  desktop();
+  return bridgeCreateVoice(request);
+};
+export const previewVoice = async (request: GeneratePayload) => {
+  desktop();
+  return bridgePreviewVoice(request);
+};
+export const readVoiceReferenceAudio = async (voiceID: string) => {
+  desktop();
+  return bridgeReadVoiceReferenceAudio(voiceID);
+};
+export const readReferenceAudioSource = async (path: string) => {
+  desktop();
+  return bridgeReadReferenceAudioSource(path);
+};
+export const saveTrimmedReferenceAudio = async (dataURL: string) => {
+  desktop();
+  return bridgeSaveTrimmedReferenceAudio(dataURL);
+};
+export const generateVoice = async (request: GeneratePayload) => {
+  desktop();
+  return bridgeGenerateVoice(request);
+};
+export const deleteVoice = async (session: Session, id: string) => {
+  desktop();
+  return bridgeDeleteVoice(session, id);
+};
+export const deleteHistory = async (id: string) => {
+  desktop();
+  return bridgeDeleteHistory(id);
+};
+export const openHistoryAudio = async (id: string) => {
+  desktop();
+  return bridgeOpenHistoryAudio(id);
+};

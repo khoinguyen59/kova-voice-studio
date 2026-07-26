@@ -1,15 +1,15 @@
 {
 	"fixed": {
-		"file_version": "{{.Info.ProductVersion}}"
+		"file_version": "1.0.1.5"
 	},
 	"info": {
 		"0000": {
-			"ProductVersion": "{{.Info.ProductVersion}}",
-			"CompanyName": "{{.Info.CompanyName}}",
-			"FileDescription": "{{.Info.ProductName}}",
-			"LegalCopyright": "{{.Info.Copyright}}",
-			"ProductName": "{{.Info.ProductName}}",
-			"Comments": "{{.Info.Comments}}"
+			"ProductVersion": "1.0.1.5",
+			"CompanyName": "KOVA",
+			"FileDescription": "KOVA Voice Studio",
+			"LegalCopyright": "Copyright (c) 2026 KOVA",
+			"ProductName": "KOVA Voice Studio",
+			"Comments": "Private desktop client for a user-controlled KOVA Voice Studio worker."
 		}
 	}
 }

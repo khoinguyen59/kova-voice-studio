@@ -4,12 +4,15 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -17,31 +20,62 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ledongthuc/pdf"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"golang.org/x/sys/windows/registry"
 )
 
 const (
-	voiceStudioNotebookURL = "https://colab.research.google.com/github/khoinguyen59/kova-video-dubbing/blob/main/voice-studio/notebooks/Kova_Voice_Studio_GPU.ipynb"
-	maxReferenceBytes      = int64(64 * 1024 * 1024)
-	maxGenerationBytes     = int64(32 * 1024 * 1024)
-	maxDocumentBytes       = int64(12 * 1024 * 1024)
-	previewSentenceVI      = "Xin chào, rất vui được gặp bạn, hẹn gặp lại."
+	voiceStudioNotebookURL  = "https://colab.research.google.com/github/khoinguyen59/kova-video-dubbing/blob/main/voice-studio/notebooks/Kova_Voice_Studio_GPU.ipynb"
+	maxReferenceBytes       = int64(64 * 1024 * 1024)
+	maxGenerationBytes      = int64(32 * 1024 * 1024)
+	maxDocumentBytes        = int64(12 * 1024 * 1024)
+	previewSentenceVI       = "Xin chào, rất vui được gặp bạn, hẹn gặp lại."
+	workerHealthTimeout     = 25 * time.Second
+	workerRequestTimeout    = 75 * time.Second
+	documentDownloadTimeout = 2 * time.Minute
+	gatewayRequestTimeout   = 2 * time.Minute
+	profileUploadTimeout    = 6 * time.Minute
+	generationTimeout       = 15 * time.Minute
 )
 
 var safeFileName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+//go:embed VERSION
+var versionFile string
+
+var applicationVersion = strings.TrimSpace(versionFile)
+
+type httpDoer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+// cancelOnClose keeps a request deadline active while the caller consumes the
+// response body, then releases the timer as soon as the body is closed.
+// http.Client.Do returns after response headers arrive, not after the full
+// audio body has been read.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (body *cancelOnClose) Close() error {
+	err := body.ReadCloser.Close()
+	body.once.Do(body.cancel)
+	return err
+}
 
 // App is an independent desktop client for the user-controlled KOVA Voice
 // Studio GPU worker. It owns a private local profile backup/history library;
 // the Colab token is intentionally session-only and never written to disk.
 type App struct {
 	ctx    context.Context
-	client *http.Client
+	client httpDoer
 	mu     sync.Mutex
 	state  studioState
 	loaded bool
@@ -52,6 +86,7 @@ type studioState struct {
 	Theme           string              `json:"theme"`
 	Locale          string              `json:"locale"`
 	WorkerURL       string              `json:"worker_url,omitempty"`
+	AudioOutputDir  string              `json:"audio_output_dir,omitempty"`
 	SelectedVoiceID string              `json:"selected_voice_id,omitempty"`
 	Voices          []VoiceProfile      `json:"voices"`
 	History         []GenerationHistory `json:"history"`
@@ -64,10 +99,12 @@ type StudioBootstrap struct {
 	Theme           string              `json:"theme"`
 	Locale          string              `json:"locale"`
 	WorkerURL       string              `json:"worker_url"`
+	AudioOutputDir  string              `json:"audio_output_dir"`
 	SelectedVoiceID string              `json:"selected_voice_id"`
 	Voices          []VoiceProfile      `json:"voices"`
 	History         []GenerationHistory `json:"history"`
 	DemoVoices      []DemoVoice         `json:"demo_voices"`
+	EmotionPresets  []EmotionPreset     `json:"emotion_presets"`
 }
 
 type WorkerSession struct {
@@ -79,14 +116,6 @@ type WorkerHealth struct {
 	Reachable bool   `json:"reachable"`
 	Message   string `json:"message"`
 	Device    string `json:"device,omitempty"`
-}
-
-// PairingSession is obtained from a single-use Colab pairing link. The token
-// is returned only to the renderer's current memory and is never persisted.
-type PairingSession struct {
-	WorkerURL string `json:"worker_url"`
-	Token     string `json:"token"`
-	Message   string `json:"message"`
 }
 
 // TaskProgress is emitted to the desktop renderer for clone, preview, and
@@ -154,6 +183,21 @@ type VoiceProfile struct {
 	WorkerURL       string `json:"worker_url,omitempty"`
 	CreatedAt       string `json:"created_at"`
 	ReferenceClean  bool   `json:"reference_clean"`
+	// ReferenceText is the user-reviewed transcript for the exact audio stored
+	// in ReferenceFile.  It is sent back to the worker whenever a profile is
+	// restored, so OmniVoice never has to guess it with Whisper on each run.
+	ReferenceText string `json:"reference_text,omitempty"`
+}
+
+// EmotionPreset contains only OmniVoice's documented non-verbal tokens. The
+// human-readable instructions are sent as `instruct`; the optional tokens are
+// offered to the AI editor as an allow-list, never free-form bracket syntax.
+type EmotionPreset struct {
+	ID       string   `json:"id"`
+	LabelVI  string   `json:"label_vi"`
+	LabelEN  string   `json:"label_en"`
+	Instruct string   `json:"instruct"`
+	Tokens   []string `json:"tokens"`
 }
 
 type DemoVoice struct {
@@ -171,25 +215,39 @@ type VoiceCreateRequest struct {
 	Name             string `json:"name"`
 	Language         string `json:"language"`
 	ReferencePath    string `json:"reference_path"`
-	ConsentConfirmed bool   `json:"consent_confirmed"`
-}
-
-type VoiceDropCreateRequest struct {
-	WorkerSession
-	Name             string `json:"name"`
-	Language         string `json:"language"`
-	ReferenceBase64  string `json:"reference_base64"`
-	ReferenceName    string `json:"reference_name"`
+	ReferenceText    string `json:"reference_text"`
 	ConsentConfirmed bool   `json:"consent_confirmed"`
 }
 
 type GenerateRequest struct {
 	WorkerSession
-	VoiceID  string  `json:"voice_id"`
-	Text     string  `json:"text"`
-	Language string  `json:"language"`
-	Speed    float64 `json:"speed"`
-	Steps    int     `json:"steps"`
+	VoiceID     string  `json:"voice_id"`
+	Text        string  `json:"text"`
+	Language    string  `json:"language"`
+	Speed       float64 `json:"speed"`
+	Steps       int     `json:"steps"`
+	StylePrompt string  `json:"style_prompt"`
+}
+
+// EmotionTextRequest uses the same session-only Gateway credentials as text
+// review, but constrains the editor to exactly one selected emotion preset.
+type EmotionTextRequest struct {
+	GatewayURL string `json:"gateway_url"`
+	APIKey     string `json:"api_key"`
+	Model      string `json:"model"`
+	Text       string `json:"text"`
+	Language   string `json:"language"`
+	EmotionID  string `json:"emotion_id"`
+}
+
+// ReferenceTranscriptRequest explicitly uploads a selected reference only
+// when the user asks for an optional transcript draft. The draft is never
+// stored or used for cloning until the user reviews and confirms it in the UI.
+type ReferenceTranscriptRequest struct {
+	WorkerSession
+	ReferencePath    string `json:"reference_path"`
+	ReferenceDataURL string `json:"reference_data_url"`
+	Language         string `json:"language"`
 }
 
 type GenerationResult struct {
@@ -198,20 +256,22 @@ type GenerationResult struct {
 }
 
 type GenerationHistory struct {
-	ID        string `json:"id"`
-	VoiceID   string `json:"voice_id"`
-	VoiceName string `json:"voice_name"`
-	Text      string `json:"text"`
-	Language  string `json:"language"`
-	FileName  string `json:"file_name"`
-	CreatedAt string `json:"created_at"`
-	SizeBytes int64  `json:"size_bytes"`
+	ID         string `json:"id"`
+	VoiceID    string `json:"voice_id"`
+	VoiceName  string `json:"voice_name"`
+	Text       string `json:"text"`
+	Language   string `json:"language"`
+	FileName   string `json:"file_name"`
+	StorageDir string `json:"storage_dir,omitempty"`
+	CreatedAt  string `json:"created_at"`
+	SizeBytes  int64  `json:"size_bytes"`
 }
 
 type PreferencesRequest struct {
 	Theme           string `json:"theme"`
 	Locale          string `json:"locale"`
 	WorkerURL       string `json:"worker_url"`
+	AudioOutputDir  string `json:"audio_output_dir"`
 	SelectedVoiceID string `json:"selected_voice_id"`
 }
 
@@ -260,13 +320,26 @@ type GatewayModel struct {
 }
 
 func NewApp() *App {
-	return &App{client: &http.Client{Timeout: 90 * time.Second}}
+	return &App{client: &http.Client{}}
+}
+
+func (a *App) do(request *http.Request, timeout time.Duration) (*http.Response, error) {
+	if a.client == nil {
+		return nil, errors.New("HTTP client is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), timeout)
+	response, err := a.client.Do(request.WithContext(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
+	return response, nil
 }
 
 func (a *App) Startup(ctx context.Context) {
 	a.ctx = ctx
 	_ = a.ensureLoaded()
-	_ = registerPairingProtocol()
 }
 
 func (a *App) Bootstrap() (StudioBootstrap, error) {
@@ -277,16 +350,44 @@ func (a *App) Bootstrap() (StudioBootstrap, error) {
 	defer a.mu.Unlock()
 	return StudioBootstrap{
 		AppName:         "KOVA Voice Studio",
-		Version:         "1.0.0.9",
+		Version:         applicationVersion,
 		NotebookURL:     voiceStudioNotebookURL,
 		Theme:           a.state.Theme,
 		Locale:          a.state.Locale,
 		WorkerURL:       a.state.WorkerURL,
+		AudioOutputDir:  a.state.AudioOutputDir,
 		SelectedVoiceID: a.state.SelectedVoiceID,
 		Voices:          copyVoices(a.state.Voices),
 		History:         copyHistory(a.state.History),
 		DemoVoices:      demoVoices(),
+		EmotionPresets:  emotionPresets(),
 	}, nil
+}
+
+func emotionPresets() []EmotionPreset {
+	return []EmotionPreset{
+		{ID: "neutral", LabelVI: "Tự nhiên", LabelEN: "Natural", Instruct: "natural, clear, conversational, neutral emotion", Tokens: []string{}},
+		{ID: "cheerful", LabelVI: "Vui vẻ", LabelEN: "Cheerful", Instruct: "warm, cheerful, smiling, conversational, medium energy", Tokens: []string{"[laughter]"}},
+		{ID: "playful", LabelVI: "Hài hước", LabelEN: "Playful", Instruct: "playful, witty, smiling, light-hearted, conversational", Tokens: []string{"[laughter]"}},
+		{ID: "energetic", LabelVI: "Sôi nổi", LabelEN: "Energetic", Instruct: "energetic, lively, upbeat, confident, clear", Tokens: []string{}},
+		{ID: "calm", LabelVI: "Bình tĩnh", LabelEN: "Calm", Instruct: "calm, gentle, measured, warm, relaxed", Tokens: []string{}},
+		{ID: "sad", LabelVI: "Buồn bã", LabelEN: "Sad", Instruct: "gentle, subdued, reflective, emotionally restrained, slightly slower", Tokens: []string{"[sigh]"}},
+		{ID: "tender", LabelVI: "Dịu dàng", LabelEN: "Tender", Instruct: "soft, warm, tender, intimate, careful pacing", Tokens: []string{}},
+		{ID: "serious", LabelVI: "Nghiêm túc", LabelEN: "Serious", Instruct: "serious, composed, professional, clear, steady", Tokens: []string{}},
+		{ID: "surprised", LabelVI: "Ngạc nhiên", LabelEN: "Surprised", Instruct: "bright, surprised, animated, natural", Tokens: []string{"[surprise-ah]", "[surprise-oh]", "[surprise-wa]", "[surprise-yo]"}},
+		{ID: "questioning", LabelVI: "Thắc mắc", LabelEN: "Questioning", Instruct: "curious, questioning, natural rising intonation", Tokens: []string{"[question-en]", "[question-ah]", "[question-oh]", "[question-ei]", "[question-yi]"}},
+		{ID: "dissatisfied", LabelVI: "Không hài lòng", LabelEN: "Dissatisfied", Instruct: "restrained dissatisfaction, firm but controlled", Tokens: []string{"[dissatisfaction-hnn]"}},
+		{ID: "confirming", LabelVI: "Khẳng định", LabelEN: "Confirming", Instruct: "affirming, confident, concise, natural", Tokens: []string{"[confirmation-en]"}},
+	}
+}
+
+func emotionPreset(id string) (EmotionPreset, bool) {
+	for _, preset := range emotionPresets() {
+		if preset.ID == strings.TrimSpace(id) {
+			return preset, true
+		}
+	}
+	return EmotionPreset{}, false
 }
 
 func (a *App) SavePreferences(request PreferencesRequest) (StudioBootstrap, error) {
@@ -295,7 +396,7 @@ func (a *App) SavePreferences(request PreferencesRequest) (StudioBootstrap, erro
 	}
 	theme := strings.ToLower(strings.TrimSpace(request.Theme))
 	if theme != "dark" && theme != "light" && theme != "system" {
-		theme = "dark"
+		theme = "light"
 	}
 	locale := strings.ToLower(strings.TrimSpace(request.Locale))
 	if locale != "vi" && locale != "en" {
@@ -309,10 +410,23 @@ func (a *App) SavePreferences(request PreferencesRequest) (StudioBootstrap, erro
 			return StudioBootstrap{}, err
 		}
 	}
+	audioOutputDir := strings.TrimSpace(request.AudioOutputDir)
+	if audioOutputDir != "" {
+		absoluteDirectory, err := filepath.Abs(audioOutputDir)
+		if err != nil {
+			return StudioBootstrap{}, fmt.Errorf("resolve audio output folder: %w", err)
+		}
+		info, err := os.Stat(absoluteDirectory)
+		if err != nil || !info.IsDir() {
+			return StudioBootstrap{}, errors.New("choose an available folder for generated audio")
+		}
+		audioOutputDir = absoluteDirectory
+	}
 	a.mu.Lock()
 	a.state.Theme = theme
 	a.state.Locale = locale
 	a.state.WorkerURL = workerURL
+	a.state.AudioOutputDir = audioOutputDir
 	if strings.TrimSpace(request.SelectedVoiceID) != "" {
 		a.state.SelectedVoiceID = strings.TrimSpace(request.SelectedVoiceID)
 	}
@@ -328,6 +442,9 @@ func (a *App) OpenColabNotebook() error {
 	if a.ctx == nil {
 		return errors.New("application is not ready")
 	}
+	// The published notebook prints a session URL/token for the user to paste
+	// into the desktop app. Keeping this explicit avoids a hidden callback,
+	// custom protocol, or background tunnel carrying credentials.
 	runtime.BrowserOpenURL(a.ctx, voiceStudioNotebookURL)
 	return nil
 }
@@ -353,7 +470,7 @@ func (a *App) CheckWorker(session WorkerSession) WorkerHealth {
 	if token := strings.TrimSpace(session.Token); token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
-	response, err := a.client.Do(request)
+	response, err := a.do(request, workerHealthTimeout)
 	if err != nil {
 		return WorkerHealth{Message: "Cannot reach the Voice Studio worker: " + err.Error()}
 	}
@@ -368,57 +485,6 @@ func (a *App) CheckWorker(session WorkerSession) WorkerHealth {
 	return WorkerHealth{Reachable: true, Message: "Voice Studio worker is ready", Device: payload.Device}
 }
 
-// ConsumeIncomingColabPairing receives the one-time link written by the
-// Windows protocol handler. It is safe to poll: no link simply returns nil.
-// The bearer token is exchanged over HTTPS and never written to studio state.
-func (a *App) ConsumeIncomingColabPairing() (*PairingSession, error) {
-	if err := a.ensureLoaded(); err != nil {
-		return nil, err
-	}
-	pairingURI, err := consumePairingInbox()
-	if err != nil || pairingURI == "" {
-		return nil, err
-	}
-	workerURL, code, err := parsePairingURI(pairingURI)
-	if err != nil {
-		return nil, err
-	}
-	request, err := http.NewRequest(http.MethodGet, workerURL+"/v1/pairing/"+url.PathEscape(code), nil)
-	if err != nil {
-		return nil, err
-	}
-	response, err := a.client.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("claim Colab pairing: %w", err)
-	}
-	defer response.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(response.Body, 64*1024))
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("Colab pairing returned %s: %s", response.Status, strings.TrimSpace(string(body)))
-	}
-	var payload struct {
-		Token string `json:"token"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("decode Colab pairing: %w", err)
-	}
-	if strings.TrimSpace(payload.Token) == "" {
-		return nil, errors.New("Colab pairing did not return a session token")
-	}
-	health := a.CheckWorker(WorkerSession{BaseURL: workerURL, Token: payload.Token})
-	if !health.Reachable {
-		return nil, errors.New(health.Message)
-	}
-	a.mu.Lock()
-	a.state.WorkerURL = workerURL
-	err = a.saveStateLocked()
-	a.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	return &PairingSession{WorkerURL: workerURL, Token: payload.Token, Message: health.Message}, nil
-}
-
 func (a *App) SelectReferenceAudio() (string, error) {
 	if a.ctx == nil {
 		return "", errors.New("application is not ready")
@@ -427,6 +493,202 @@ func (a *App) SelectReferenceAudio() (string, error) {
 		Title:   "Choose voice reference audio",
 		Filters: []runtime.FileFilter{{DisplayName: "Audio reference (WAV, MP3, FLAC)", Pattern: "*.wav;*.mp3;*.flac"}},
 	})
+}
+
+// ReadReferenceAudioSource lets the renderer draw and trim a newly selected
+// sample locally. The source stays in the desktop process; it is never sent to
+// a worker until the user confirms profile creation.
+func (a *App) ReadReferenceAudioSource(path string) (string, error) {
+	path, err := filepath.Abs(strings.TrimSpace(path))
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return "", errors.New("reference audio file is unavailable or empty")
+	}
+	if info.Size() > maxReferenceBytes || !allowedReferenceExtension(filepath.Ext(path)) {
+		return "", errors.New("reference audio must be a WAV, MP3, or FLAC file under 64 MiB")
+	}
+	audio, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read reference audio: %w", err)
+	}
+	return audioDataURL(path, audio), nil
+}
+
+// SaveTrimmedReferenceAudio persists a browser-created PCM WAV crop in a
+// private incoming folder. It is removed after a successful profile backup;
+// keeping it private avoids writing an unexpected cut file beside the user's
+// original recording.
+func (a *App) SaveTrimmedReferenceAudio(dataURL string) (string, error) {
+	prefix, encoded, found := strings.Cut(strings.TrimSpace(dataURL), ",")
+	if !found || !strings.HasPrefix(strings.ToLower(prefix), "data:audio/wav;base64") {
+		return "", errors.New("trimmed reference must be a WAV data URL")
+	}
+	audio, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", errors.New("trimmed reference audio is invalid")
+	}
+	if len(audio) < 44 || int64(len(audio)) > maxReferenceBytes || string(audio[:4]) != "RIFF" || string(audio[8:12]) != "WAVE" {
+		return "", errors.New("trimmed reference must be a valid WAV file under 64 MiB")
+	}
+	directory := filepath.Join(a.dataDir(), "incoming")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(directory, fmt.Sprintf("reference-cut-%d.wav", time.Now().UnixNano()))
+	if err := os.WriteFile(path, audio, 0600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// AutoTranscribeReference asks the connected user-controlled worker for a
+// draft only. Unlike profile creation, this call does not create a clone,
+// persist a profile, or alter the original audio.
+func (a *App) AutoTranscribeReference(input ReferenceTranscriptRequest) (string, error) {
+	path := strings.TrimSpace(input.ReferencePath)
+	temporary := false
+	if strings.TrimSpace(input.ReferenceDataURL) != "" {
+		var err error
+		path, err = a.SaveTrimmedReferenceAudio(input.ReferenceDataURL)
+		if err != nil {
+			return "", err
+		}
+		temporary = true
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if temporary {
+		defer os.Remove(path)
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxReferenceBytes || !allowedReferenceExtension(filepath.Ext(path)) {
+		return "", errors.New("choose an available WAV, MP3, or FLAC reference file under 64 MiB")
+	}
+	baseURL, err := normalizeWorkerURL(input.BaseURL)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(input.Token) == "" {
+		return "", errors.New("connect to the current Colab worker before requesting an automatic transcript")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	if err := writer.WriteField("language", first(strings.TrimSpace(input.Language), "vi")); err != nil {
+		return "", err
+	}
+	part, err := writer.CreateFormFile("ref_audio", filepath.Base(path))
+	if err != nil {
+		return "", err
+	}
+	if _, err = io.Copy(part, io.LimitReader(file, maxReferenceBytes+1)); err != nil {
+		return "", err
+	}
+	if err = writer.Close(); err != nil {
+		return "", err
+	}
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/transcribe-reference", body)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(input.Token))
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response, err := a.do(request, profileUploadTimeout)
+	if err != nil {
+		return "", fmt.Errorf("automatic reference transcript: %w", err)
+	}
+	defer response.Body.Close()
+	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode == http.StatusNotFound {
+		return "", errors.New("this Colab worker does not support automatic reference transcripts yet. Run the updated KOVA Voice Studio notebook or enter the transcript manually")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("automatic transcript returned %s: %s", response.Status, strings.TrimSpace(string(payload)))
+	}
+	var result struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return "", fmt.Errorf("decode automatic reference transcript: %w", err)
+	}
+	result.Text = normalizeImportedText(result.Text)
+	if result.Text == "" || len([]rune(result.Text)) > 2000 {
+		return "", errors.New("worker did not return a usable reference transcript")
+	}
+	return result.Text, nil
+}
+
+func audioDataURL(path string, audio []byte) string {
+	contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+	if contentType == "" {
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".mp3":
+			contentType = "audio/mpeg"
+		case ".flac":
+			contentType = "audio/flac"
+		default:
+			contentType = "audio/wav"
+		}
+	}
+	return "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(audio)
+}
+
+// SelectAudioOutputDirectory lets the user choose where newly generated audio
+// files are saved. Existing history keeps its own recorded location, so it
+// remains available after this preference changes.
+func (a *App) SelectAudioOutputDirectory() (string, error) {
+	if err := a.ensureLoaded(); err != nil {
+		return "", err
+	}
+	if a.ctx == nil {
+		return "", errors.New("application is not ready")
+	}
+	a.mu.Lock()
+	defaultDirectory := a.state.AudioOutputDir
+	a.mu.Unlock()
+	options := runtime.OpenDialogOptions{Title: "Choose folder for generated audio"}
+	if info, err := os.Stat(defaultDirectory); defaultDirectory != "" && err == nil && info.IsDir() {
+		options.DefaultDirectory = defaultDirectory
+	}
+	return runtime.OpenDirectoryDialog(a.ctx, options)
+}
+
+// ReadVoiceReferenceAudio returns only the backed-up reference audio as a
+// browser-playable data URL. The actual private path is never exposed to the
+// renderer and this operation intentionally does not require a GPU worker.
+func (a *App) ReadVoiceReferenceAudio(voiceID string) (string, error) {
+	if err := a.ensureLoaded(); err != nil {
+		return "", err
+	}
+	profile, err := a.profile(voiceID)
+	if err != nil {
+		return "", err
+	}
+	if profile.ReferenceFile == "" {
+		return "", errors.New("this voice has no local reference audio to play")
+	}
+	path := filepath.Join(a.dataDir(), "references", filepath.Base(profile.ReferenceFile))
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return "", errors.New("the local reference backup is unavailable. Choose the original audio and recreate this voice")
+	}
+	if info.Size() > maxReferenceBytes {
+		return "", errors.New("the local reference audio is too large to play in the app")
+	}
+	audio, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read local reference audio: %w", err)
+	}
+	return audioDataURL(path, audio), nil
 }
 
 // SelectTextDocument opens a native picker for formats that can be reviewed
@@ -510,7 +772,7 @@ func (a *App) ImportGoogleDriveDocument(sharedURL string) (ImportedDocument, err
 	if err != nil {
 		return ImportedDocument{}, err
 	}
-	response, err := a.client.Do(request)
+	response, err := a.do(request, documentDownloadTimeout)
 	if err != nil {
 		return ImportedDocument{}, fmt.Errorf("download shared Google Drive file: %w", err)
 	}
@@ -605,7 +867,7 @@ func (a *App) ReviewTextWithGateway(input TextReviewRequest) (TextReviewResult, 
 	}
 	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(input.APIKey))
 	request.Header.Set("Content-Type", "application/json")
-	response, err := a.client.Do(request)
+	response, err := a.do(request, gatewayRequestTimeout)
 	if err != nil {
 		return TextReviewResult{}, fmt.Errorf("AI Gateway review: %w", err)
 	}
@@ -649,6 +911,85 @@ func (a *App) ReviewTextWithGateway(input TextReviewRequest) (TextReviewResult, 
 	return result, nil
 }
 
+// ApplyEmotionWithGateway prepares an existing script for a selected
+// OmniVoice style. It preserves content and can insert only tokens published
+// by OmniVoice for that preset; the user still reviews the result before it is
+// ever sent to the GPU worker.
+func (a *App) ApplyEmotionWithGateway(input EmotionTextRequest) (TextReviewResult, error) {
+	textValue := strings.TrimSpace(input.Text)
+	if textValue == "" || len([]rune(textValue)) > 10000 {
+		return TextReviewResult{}, errors.New("text must contain 1–10,000 characters")
+	}
+	preset, found := emotionPreset(input.EmotionID)
+	if !found {
+		return TextReviewResult{}, errors.New("choose a supported emotion")
+	}
+	baseURL, err := normalizeGatewayURL(input.GatewayURL)
+	if err != nil {
+		return TextReviewResult{}, err
+	}
+	if strings.TrimSpace(input.APIKey) == "" {
+		return TextReviewResult{}, errors.New("enter an API Gateway key for this session")
+	}
+	model := first(strings.TrimSpace(input.Model), "deepseek-v4-flash:cloud")
+	language := first(strings.TrimSpace(input.Language), "vi")
+	allowed := "none"
+	if len(preset.Tokens) > 0 {
+		allowed = strings.Join(preset.Tokens, ", ")
+	}
+	prompt := "Prepare the following " + language + " speech script for this vocal style: " + preset.Instruct + ". Preserve every fact, proper name, number, URL, and user intent. Improve punctuation and sentence breaks only when it makes spoken delivery clearer. You MAY use only these exact OmniVoice non-verbal tokens: " + allowed + ". Do not invent bracketed tags, do not use a token more than once per sentence, and omit tokens when unnatural. Return ONLY valid JSON with revised_text (string), review_summary (string), warnings (array of strings).\n\nTEXT:\n" + textValue
+	payload := map[string]any{"model": model, "temperature": 0.2, "messages": []map[string]string{{"role": "system", "content": "You are a precise speech editor. Keep the user's wording and facts; use only the supplied allowed token list."}, {"role": "user", "content": prompt}}}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return TextReviewResult{}, err
+	}
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(encoded))
+	if err != nil {
+		return TextReviewResult{}, err
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(input.APIKey))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := a.do(request, gatewayRequestTimeout)
+	if err != nil {
+		return TextReviewResult{}, fmt.Errorf("AI Gateway emotion edit: %w", err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return TextReviewResult{}, fmt.Errorf("AI Gateway returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	var completion struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &completion); err != nil || len(completion.Choices) == 0 {
+		return TextReviewResult{}, errors.New("AI Gateway returned no usable emotion edit")
+	}
+	content := strings.TrimSpace(completion.Choices[0].Message.Content)
+	start, end := strings.Index(content, "{"), strings.LastIndex(content, "}")
+	if start < 0 || end <= start {
+		return TextReviewResult{}, errors.New("AI Gateway did not return the required JSON emotion edit")
+	}
+	var result TextReviewResult
+	if err := json.Unmarshal([]byte(content[start:end+1]), &result); err != nil {
+		return TextReviewResult{}, fmt.Errorf("decode AI emotion JSON: %w", err)
+	}
+	result.RevisedText = normalizeImportedText(result.RevisedText)
+	if result.RevisedText == "" {
+		return TextReviewResult{}, errors.New("AI Gateway emotion edit did not contain revised text")
+	}
+	if len([]rune(result.RevisedText)) > 10000 {
+		result.RevisedText = string([]rune(result.RevisedText)[:10000])
+	}
+	if result.Warnings == nil {
+		result.Warnings = []string{}
+	}
+	return result, nil
+}
+
 // ListGatewayModels reads an OpenAI-compatible /v1/models endpoint and
 // returns every model which the gateway explicitly prices at zero.  A few
 // providers omit pricing entirely; in that case all returned models are shown
@@ -666,7 +1007,7 @@ func (a *App) ListGatewayModels(input GatewayModelsRequest) ([]GatewayModel, err
 	if key := strings.TrimSpace(input.APIKey); key != "" {
 		request.Header.Set("Authorization", "Bearer "+key)
 	}
-	response, err := a.client.Do(request)
+	response, err := a.do(request, gatewayRequestTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("load AI Gateway models: %w", err)
 	}
@@ -734,11 +1075,20 @@ func gatewayPricingIsFree(pricing map[string]json.RawMessage) bool {
 		return false
 	}
 	for _, raw := range pricing {
-		value := strings.Trim(strings.TrimSpace(string(raw)), `"`)
-		if value == "" || value == "0" || value == "0.0" || value == "0.00" || value == "0.000000" {
-			continue
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			var number json.Number
+			decoder := json.NewDecoder(bytes.NewReader(raw))
+			decoder.UseNumber()
+			if err := decoder.Decode(&number); err != nil {
+				return false
+			}
+			value = number.String()
 		}
-		return false
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed != 0 {
+			return false
+		}
 	}
 	return true
 }
@@ -794,56 +1144,7 @@ func (a *App) CreateVoice(request VoiceCreateRequest) (profile VoiceProfile, err
 	if strings.TrimSpace(request.ReferencePath) == "" {
 		return VoiceProfile{}, errors.New("choose a WAV, MP3, or FLAC reference file")
 	}
-	return a.createVoiceFromFile(request.WorkerSession, request.Name, request.Language, request.ReferencePath, request.ConsentConfirmed, progress)
-}
-
-func (a *App) CreateVoiceFromDrop(request VoiceDropCreateRequest) (profile VoiceProfile, err error) {
-	progress := a.startTask("clone", "Đang đọc audio mẫu đã kéo thả")
-	defer func() {
-		if err != nil {
-			progress.fail("Tạo clone thất bại: " + err.Error())
-			return
-		}
-		progress.done("Clone đã lưu. Phòng thu sẽ tái sử dụng profile này, không clone lại.")
-	}()
-	if err := a.ensureLoaded(); err != nil {
-		return VoiceProfile{}, err
-	}
-	encoded := strings.TrimSpace(request.ReferenceBase64)
-	if comma := strings.IndexByte(encoded, ','); strings.HasPrefix(encoded, "data:") && comma >= 0 {
-		encoded = encoded[comma+1:]
-	}
-	data, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return VoiceProfile{}, errors.New("the dropped audio could not be read")
-	}
-	if len(data) == 0 || int64(len(data)) > maxReferenceBytes {
-		return VoiceProfile{}, fmt.Errorf("reference audio must be between 1 byte and %d MiB", maxReferenceBytes/(1024*1024))
-	}
-	name := safeReferenceName(request.ReferenceName)
-	if !allowedReferenceExtension(filepath.Ext(name)) {
-		return VoiceProfile{}, errors.New("dropped audio must be WAV, MP3, or FLAC")
-	}
-	incoming := filepath.Join(a.dataDir(), "incoming")
-	if err := os.MkdirAll(incoming, 0700); err != nil {
-		return VoiceProfile{}, err
-	}
-	temporary, err := os.CreateTemp(incoming, "drop-*"+filepath.Ext(name))
-	if err != nil {
-		return VoiceProfile{}, err
-	}
-	temporaryPath := temporary.Name()
-	if _, err := temporary.Write(data); err != nil {
-		temporary.Close()
-		_ = os.Remove(temporaryPath)
-		return VoiceProfile{}, err
-	}
-	if err := temporary.Close(); err != nil {
-		_ = os.Remove(temporaryPath)
-		return VoiceProfile{}, err
-	}
-	defer os.Remove(temporaryPath)
-	return a.createVoiceFromFile(request.WorkerSession, request.Name, request.Language, temporaryPath, request.ConsentConfirmed, progress)
+	return a.createVoiceFromFile(request.WorkerSession, request.Name, request.Language, request.ReferencePath, request.ReferenceText, request.ConsentConfirmed, progress)
 }
 
 func (a *App) PreviewVoice(request GenerateRequest) (result GenerationResult, err error) {
@@ -902,22 +1203,18 @@ func (a *App) DeleteVoice(session WorkerSession, voiceID string) ([]VoiceProfile
 		if err != nil {
 			return nil, err
 		}
-		request, _ := http.NewRequest(http.MethodDelete, baseURL+"/v1/profiles/"+url.PathEscape(profile.RemoteID), nil)
-		request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(session.Token))
-		response, err := a.client.Do(request)
-		if err != nil {
-			return nil, fmt.Errorf("delete profile from Voice Studio: %w", err)
+		if err := a.deleteRemoteProfile(baseURL, session.Token, profile.RemoteID); err != nil {
+			return nil, err
 		}
-		defer response.Body.Close()
-		if response.StatusCode != http.StatusNotFound && (response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices) {
-			return nil, fmt.Errorf("Voice Studio delete returned %s", response.Status)
+	}
+	if profile.ReferenceFile != "" {
+		path := filepath.Join(a.dataDir(), "references", filepath.Base(profile.ReferenceFile))
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("remove local voice backup: %w", err)
 		}
 	}
 
 	a.mu.Lock()
-	if profile.ReferenceFile != "" {
-		_ = os.Remove(filepath.Join(a.dataDir(), "references", filepath.Base(profile.ReferenceFile)))
-	}
 	a.state.Voices = append(a.state.Voices[:index], a.state.Voices[index+1:]...)
 	if a.state.SelectedVoiceID == voiceID {
 		a.state.SelectedVoiceID = ""
@@ -944,7 +1241,11 @@ func (a *App) DeleteHistory(id string) ([]GenerationHistory, error) {
 		a.mu.Unlock()
 		return nil, errors.New("history item was not found")
 	}
-	_ = os.Remove(filepath.Join(a.dataDir(), "history", filepath.Base(a.state.History[index].FileName)))
+	path := a.historyPath(a.state.History[index])
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("remove saved audio: %w", err)
+	}
 	a.state.History = append(a.state.History[:index], a.state.History[index+1:]...)
 	err := a.saveStateLocked()
 	history := copyHistory(a.state.History)
@@ -957,25 +1258,31 @@ func (a *App) OpenHistoryAudio(id string) error {
 		return err
 	}
 	a.mu.Lock()
-	var fileName string
-	for _, item := range a.state.History {
-		if item.ID == strings.TrimSpace(id) {
-			fileName = item.FileName
+	var item GenerationHistory
+	found := false
+	for _, candidate := range a.state.History {
+		if candidate.ID == strings.TrimSpace(id) {
+			item = candidate
+			found = true
 			break
 		}
 	}
 	a.mu.Unlock()
-	if fileName == "" {
+	if !found {
 		return errors.New("history item was not found")
 	}
-	path := filepath.Join(a.dataDir(), "history", filepath.Base(fileName))
+	path := a.historyPath(item)
 	if info, err := os.Stat(path); err != nil || info.IsDir() {
 		return errors.New("saved audio file is unavailable")
 	}
 	if a.ctx == nil {
 		return errors.New("application is not ready")
 	}
-	u := &url.URL{Scheme: "file", Path: path}
+	urlPath := filepath.ToSlash(path)
+	if len(urlPath) >= 2 && urlPath[1] == ':' {
+		urlPath = "/" + urlPath
+	}
+	u := &url.URL{Scheme: "file", Path: urlPath}
 	runtime.BrowserOpenURL(a.ctx, u.String())
 	return nil
 }
@@ -1003,6 +1310,7 @@ func (a *App) ensureLoaded() error {
 		info, statErr := os.Stat(path)
 		profile.BackupAvailable = statErr == nil && !info.IsDir() && info.Size() > 0
 	}
+	a.reconcileLibraryArtifacts(state)
 	a.state = state
 	a.loaded = true
 	return nil
@@ -1010,6 +1318,71 @@ func (a *App) ensureLoaded() error {
 
 func (a *App) dataDir() string {
 	return voiceStudioDataDir()
+}
+
+func (a *App) privateHistoryDirectory() string {
+	return filepath.Join(a.dataDir(), "history")
+}
+
+func (a *App) historyPath(item GenerationHistory) string {
+	directory := strings.TrimSpace(item.StorageDir)
+	if directory == "" {
+		directory = a.privateHistoryDirectory()
+	}
+	return filepath.Join(directory, filepath.Base(item.FileName))
+}
+
+func (a *App) audioOutputDirectory() (directory, storageDir string, err error) {
+	a.mu.Lock()
+	directory = strings.TrimSpace(a.state.AudioOutputDir)
+	a.mu.Unlock()
+	if directory == "" {
+		return a.privateHistoryDirectory(), "", nil
+	}
+	directory, err = filepath.Abs(directory)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve audio output folder: %w", err)
+	}
+	info, err := os.Stat(directory)
+	if err != nil || !info.IsDir() {
+		return "", "", errors.New("the selected audio output folder is unavailable. Choose another folder in Settings")
+	}
+	return directory, directory, nil
+}
+
+// reconcileLibraryArtifacts removes files that are no longer referenced by the
+// private state file. It is deliberately best-effort: a locked file stays
+// visible to the user through its metadata and can be retried later.
+func (a *App) reconcileLibraryArtifacts(state studioState) {
+	history := make(map[string]struct{}, len(state.History))
+	for _, item := range state.History {
+		if strings.TrimSpace(item.StorageDir) == "" {
+			history[filepath.Base(item.FileName)] = struct{}{}
+		}
+	}
+	references := make(map[string]struct{}, len(state.Voices))
+	for _, profile := range state.Voices {
+		if profile.ReferenceFile != "" {
+			references[filepath.Base(profile.ReferenceFile)] = struct{}{}
+		}
+	}
+	a.removeUnreferencedFiles(a.privateHistoryDirectory(), history)
+	a.removeUnreferencedFiles(filepath.Join(a.dataDir(), "references"), references)
+}
+
+func (a *App) removeUnreferencedFiles(directory string, known map[string]struct{}) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, found := known[entry.Name()]; !found {
+			_ = os.Remove(filepath.Join(directory, entry.Name()))
+		}
+	}
 }
 
 func voiceStudioDataDir() string {
@@ -1020,103 +1393,6 @@ func voiceStudioDataDir() string {
 		return filepath.Join(root, "KOVA Voice Studio")
 	}
 	return "kova-voice-studio-data"
-}
-
-func pairingInboxPath() string {
-	return filepath.Join(voiceStudioDataDir(), "incoming-colab-pairing.json")
-}
-
-func storeIncomingPairing(pairingURI string) error {
-	if _, _, err := parsePairingURI(pairingURI); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(voiceStudioDataDir(), 0700); err != nil {
-		return err
-	}
-	payload, err := json.Marshal(struct {
-		URI        string `json:"uri"`
-		ReceivedAt string `json:"received_at"`
-	}{URI: pairingURI, ReceivedAt: time.Now().UTC().Format(time.RFC3339)})
-	if err != nil {
-		return err
-	}
-	path := pairingInboxPath()
-	temporary := path + ".tmp"
-	if err := os.WriteFile(temporary, payload, 0600); err != nil {
-		return err
-	}
-	// Windows does not consistently replace an existing destination on Rename.
-	// A newer one-time link is more useful than an already-unclaimed one.
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		_ = os.Remove(temporary)
-		return err
-	}
-	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
-		return err
-	}
-	return nil
-}
-
-func consumePairingInbox() (string, error) {
-	path := pairingInboxPath()
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	if err := os.Remove(path); err != nil {
-		return "", err
-	}
-	var payload struct {
-		URI string `json:"uri"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", fmt.Errorf("decode Colab pairing inbox: %w", err)
-	}
-	return strings.TrimSpace(payload.URI), nil
-}
-
-func parsePairingURI(raw string) (string, string, error) {
-	pairing, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || pairing.Scheme != "kova-voice-studio" || !strings.EqualFold(pairing.Host, "pair") {
-		return "", "", errors.New("invalid KOVA Voice Studio pairing link")
-	}
-	workerURL, err := normalizeWorkerURL(pairing.Query().Get("worker_url"))
-	if err != nil {
-		return "", "", err
-	}
-	code := strings.TrimSpace(pairing.Query().Get("code"))
-	if len(code) < 24 || len(code) > 256 {
-		return "", "", errors.New("invalid Colab pairing code")
-	}
-	return workerURL, code, nil
-}
-
-func registerPairingProtocol() error {
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	key, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Classes\kova-voice-studio`, registry.SET_VALUE)
-	if err != nil {
-		return err
-	}
-	defer key.Close()
-	if err := key.SetStringValue("", "URL:KOVA Voice Studio pairing"); err != nil {
-		return err
-	}
-	if err := key.SetStringValue("URL Protocol", ""); err != nil {
-		return err
-	}
-	command, _, err := registry.CreateKey(key, `shell\open\command`, registry.SET_VALUE)
-	if err != nil {
-		return err
-	}
-	defer command.Close()
-	return command.SetStringValue("", fmt.Sprintf(`"%s" --pair "%%1"`, executable))
 }
 
 func (a *App) statePath() string { return filepath.Join(a.dataDir(), "studio-state.json") }
@@ -1160,7 +1436,7 @@ func (a *App) saveStateLocked() error {
 func loadState(path string) (studioState, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return studioState{Version: 1, Theme: "dark", Locale: "vi", Voices: []VoiceProfile{}, History: []GenerationHistory{}}, nil
+		return studioState{Version: 1, Theme: "light", Locale: "vi", Voices: []VoiceProfile{}, History: []GenerationHistory{}}, nil
 	}
 	if err != nil {
 		return studioState{}, fmt.Errorf("read Voice Studio library: %w", err)
@@ -1180,11 +1456,12 @@ func loadState(path string) (studioState, error) {
 
 func normalizeState(state studioState) studioState {
 	if state.Theme == "" {
-		state.Theme = "dark"
+		state.Theme = "light"
 	}
 	if state.Locale == "" {
 		state.Locale = "vi"
 	}
+	state.AudioOutputDir = strings.TrimSpace(state.AudioOutputDir)
 	if state.Voices == nil {
 		state.Voices = []VoiceProfile{}
 	}
@@ -1194,7 +1471,7 @@ func normalizeState(state studioState) studioState {
 	return state
 }
 
-func (a *App) createVoiceFromFile(session WorkerSession, name, language, sourcePath string, consent bool, progress *taskReporter) (VoiceProfile, error) {
+func (a *App) createVoiceFromFile(session WorkerSession, name, language, sourcePath, referenceText string, consent bool, progress *taskReporter) (VoiceProfile, error) {
 	progress.update("validate_reference", 10, "Đang kiểm tra audio mẫu và quyền clone", "running")
 	if err := a.ensureLoaded(); err != nil {
 		return VoiceProfile{}, err
@@ -1224,6 +1501,13 @@ func (a *App) createVoiceFromFile(session WorkerSession, name, language, sourceP
 	if !allowedReferenceExtension(filepath.Ext(sourcePath)) {
 		return VoiceProfile{}, errors.New("reference audio must be WAV, MP3, or FLAC")
 	}
+	referenceText = normalizeImportedText(referenceText)
+	if referenceText == "" {
+		return VoiceProfile{}, errors.New("enter the exact spoken transcript for the selected reference audio")
+	}
+	if len([]rune(referenceText)) > 2000 {
+		return VoiceProfile{}, errors.New("reference transcript must not exceed 2,000 characters")
+	}
 	baseURL, err := normalizeWorkerURL(session.BaseURL)
 	if err != nil {
 		return VoiceProfile{}, err
@@ -1235,20 +1519,28 @@ func (a *App) createVoiceFromFile(session WorkerSession, name, language, sourceP
 	// accepts the reference. Keeping this explicit stops music-contaminated
 	// input from being mistaken for a successful clone.
 	progress.update("separate_voice_music", 35, "GPU Colab is separating the spoken voice from music before cloning", "running")
-	remote, err := a.uploadProfile(baseURL, session.Token, name, language, sourcePath)
+	remote, err := a.uploadProfile(baseURL, session.Token, name, language, referenceText, sourcePath)
 	if err != nil {
 		return VoiceProfile{}, err
+	}
+	cleanupRemote := func(cause error) error {
+		if cleanupErr := a.deleteRemoteProfile(baseURL, session.Token, remote.ID); cleanupErr != nil {
+			return fmt.Errorf("%w; could not remove incomplete worker profile: %v", cause, cleanupErr)
+		}
+		return cause
 	}
 	progress.update("backup_reference", 78, "Clean vocal reference is ready; saving a private local backup", "running")
 	profile := VoiceProfile{
 		ID: remote.ID, RemoteID: remote.ID, Name: first(remote.Name, name), Language: first(remote.Language, language),
 		Status: first(remote.Status, "ready"), Kind: "cloned", WorkerURL: baseURL,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339), ReferenceClean: remote.ReferenceClean,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339), ReferenceClean: remote.ReferenceClean, ReferenceText: referenceText,
 	}
 	if err := a.storeReference(&profile, sourcePath); err != nil {
-		return VoiceProfile{}, err
+		return VoiceProfile{}, cleanupRemote(err)
 	}
 	a.mu.Lock()
+	previousVoices := copyVoices(a.state.Voices)
+	previousSelectedVoiceID := a.state.SelectedVoiceID
 	for i := range a.state.Voices {
 		if a.state.Voices[i].ID == profile.ID {
 			a.state.Voices[i] = profile
@@ -1268,12 +1560,29 @@ func (a *App) createVoiceFromFile(session WorkerSession, name, language, sourceP
 	}
 	a.state.SelectedVoiceID = profile.ID
 	err = a.saveStateLocked()
+	if err != nil {
+		a.state.Voices = previousVoices
+		a.state.SelectedVoiceID = previousSelectedVoiceID
+	}
 	a.mu.Unlock()
 	if err != nil {
-		return VoiceProfile{}, err
+		_ = os.Remove(filepath.Join(a.dataDir(), "references", profile.ReferenceFile))
+		return VoiceProfile{}, cleanupRemote(err)
 	}
 	progress.update("save_profile", 96, "Đang lưu profile vào thư viện dùng lại", "running")
+	if isIncomingReference(a.dataDir(), sourcePath) {
+		_ = os.Remove(sourcePath)
+	}
 	return profile, nil
+}
+
+func isIncomingReference(dataDirectory, sourcePath string) bool {
+	incoming, incomingErr := filepath.Abs(filepath.Join(dataDirectory, "incoming"))
+	source, sourceErr := filepath.Abs(sourcePath)
+	if incomingErr != nil || sourceErr != nil {
+		return false
+	}
+	return filepath.Dir(source) == incoming && strings.HasPrefix(filepath.Base(source), "reference-cut-")
 }
 
 func (a *App) storeReference(profile *VoiceProfile, sourcePath string) error {
@@ -1290,7 +1599,7 @@ func (a *App) storeReference(profile *VoiceProfile, sourcePath string) error {
 	return nil
 }
 
-func (a *App) uploadProfile(baseURL, token, name, language, sourcePath string) (VoiceProfile, error) {
+func (a *App) uploadProfile(baseURL, token, name, language, referenceText, sourcePath string) (VoiceProfile, error) {
 	file, err := os.Open(sourcePath)
 	if err != nil {
 		return VoiceProfile{}, err
@@ -1298,7 +1607,7 @@ func (a *App) uploadProfile(baseURL, token, name, language, sourcePath string) (
 	defer file.Close()
 	buffer := &bytes.Buffer{}
 	writer := multipart.NewWriter(buffer)
-	for field, value := range map[string]string{"name": name, "language": language, "consent_confirmed": "true"} {
+	for field, value := range map[string]string{"name": name, "language": language, "ref_text": referenceText, "consent_confirmed": "true"} {
 		if err := writer.WriteField(field, value); err != nil {
 			return VoiceProfile{}, err
 		}
@@ -1319,7 +1628,7 @@ func (a *App) uploadProfile(baseURL, token, name, language, sourcePath string) (
 	}
 	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
 	request.Header.Set("Content-Type", writer.FormDataContentType())
-	response, err := a.client.Do(request)
+	response, err := a.do(request, profileUploadTimeout)
 	if err != nil {
 		return VoiceProfile{}, fmt.Errorf("upload reference to Voice Studio: %w", err)
 	}
@@ -1342,6 +1651,23 @@ func (a *App) uploadProfile(baseURL, token, name, language, sourcePath string) (
 		return VoiceProfile{}, errors.New("Voice Studio did not return a profile id")
 	}
 	return payload.Profile, nil
+}
+
+func (a *App) deleteRemoteProfile(baseURL, token, remoteID string) error {
+	request, err := http.NewRequest(http.MethodDelete, baseURL+"/v1/profiles/"+url.PathEscape(remoteID), nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	response, err := a.do(request, workerRequestTimeout)
+	if err != nil {
+		return fmt.Errorf("delete profile from Voice Studio: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNotFound && (response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices) {
+		return fmt.Errorf("Voice Studio delete returned %s", response.Status)
+	}
+	return nil
 }
 
 func (a *App) generate(request GenerateRequest, save bool, progress *taskReporter) (GenerationResult, error) {
@@ -1377,11 +1703,16 @@ func (a *App) generate(request GenerateRequest, save bool, progress *taskReporte
 	if steps < 1 || steps > 64 {
 		steps = 32
 	}
+	stylePrompt := strings.TrimSpace(request.StylePrompt)
+	if len([]rune(stylePrompt)) > 500 {
+		return GenerationResult{}, errors.New("voice style instruction must not exceed 500 characters")
+	}
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	for field, value := range map[string]string{
 		"text": text, "profile_id": remoteID, "language": first(strings.TrimSpace(request.Language), profile.Language),
 		"speed": fmt.Sprintf("%.2f", speed), "num_step": fmt.Sprintf("%d", steps), "output_format": "wav",
+		"ref_text": profile.ReferenceText, "instruct": stylePrompt,
 	} {
 		if err := writer.WriteField(field, value); err != nil {
 			return GenerationResult{}, err
@@ -1397,7 +1728,7 @@ func (a *App) generate(request GenerateRequest, save bool, progress *taskReporte
 	}
 	httpRequest.Header.Set("Authorization", "Bearer "+strings.TrimSpace(request.Token))
 	httpRequest.Header.Set("Content-Type", writer.FormDataContentType())
-	response, err := a.client.Do(httpRequest)
+	response, err := a.do(httpRequest, generationTimeout)
 	if err != nil {
 		return GenerationResult{}, fmt.Errorf("generate audio: %w", err)
 	}
@@ -1419,7 +1750,11 @@ func (a *App) generate(request GenerateRequest, save bool, progress *taskReporte
 	}
 	id := fmt.Sprintf("g-%d", time.Now().UnixNano())
 	fileName := id + ".wav"
-	destination := filepath.Join(a.dataDir(), "history", fileName)
+	outputDirectory, storageDir, err := a.audioOutputDirectory()
+	if err != nil {
+		return GenerationResult{}, err
+	}
+	destination := filepath.Join(outputDirectory, fileName)
 	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
 		return GenerationResult{}, err
 	}
@@ -1427,11 +1762,22 @@ func (a *App) generate(request GenerateRequest, save bool, progress *taskReporte
 		return GenerationResult{}, err
 	}
 	progress.update("save_audio", 94, "Đang lưu audio vào lịch sử cục bộ", "running")
-	item := GenerationHistory{ID: id, VoiceID: profile.ID, VoiceName: profile.Name, Text: text, Language: first(strings.TrimSpace(request.Language), profile.Language), FileName: fileName, CreatedAt: time.Now().UTC().Format(time.RFC3339), SizeBytes: int64(len(audio))}
+	item := GenerationHistory{ID: id, VoiceID: profile.ID, VoiceName: profile.Name, Text: text, Language: first(strings.TrimSpace(request.Language), profile.Language), FileName: fileName, StorageDir: storageDir, CreatedAt: time.Now().UTC().Format(time.RFC3339), SizeBytes: int64(len(audio))}
 	a.mu.Lock()
 	a.state.History = append([]GenerationHistory{item}, a.state.History...)
 	if len(a.state.History) > 100 {
-		a.state.History = a.state.History[:100]
+		stale := append([]GenerationHistory(nil), a.state.History[100:]...)
+		canTrim := true
+		for _, entry := range stale {
+			path := a.historyPath(entry)
+			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				canTrim = false
+				break
+			}
+		}
+		if canTrim {
+			a.state.History = a.state.History[:100]
+		}
 	}
 	err = a.saveStateLocked()
 	a.mu.Unlock()
@@ -1470,7 +1816,7 @@ func (a *App) ensureRemote(profile VoiceProfile, baseURL, token string) (string,
 	if info, err := os.Stat(path); err != nil || info.IsDir() || info.Size() == 0 {
 		return "", errors.New("the local reference backup is unavailable")
 	}
-	restored, err := a.uploadProfile(baseURL, token, profile.Name, profile.Language, path)
+	restored, err := a.uploadProfile(baseURL, token, profile.Name, profile.Language, profile.ReferenceText, path)
 	if err != nil {
 		return "", fmt.Errorf("restore voice on the current Colab worker: %w", err)
 	}
@@ -1497,7 +1843,7 @@ func (a *App) remoteVoices(baseURL, token string) ([]VoiceProfile, error) {
 		return nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
-	response, err := a.client.Do(request)
+	response, err := a.do(request, workerRequestTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("load Voice Studio profiles: %w", err)
 	}
@@ -1530,8 +1876,13 @@ func normalizeGatewayURL(raw string) (string, error) {
 		return "", errors.New("enter an AI Gateway URL")
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
 		return "", errors.New("AI Gateway URL must start with http:// or https://")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	local := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if parsed.Scheme != "https" && !local {
+		return "", errors.New("AI Gateway must use HTTPS except localhost")
 	}
 	// Users may paste the OpenAI-compatible /v1 endpoint or just the host.
 	path := strings.TrimRight(parsed.Path, "/")

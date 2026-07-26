@@ -1,6 +1,4 @@
 import {
-  ChangeEvent,
-  DragEvent,
   useEffect,
   useMemo,
   useRef,
@@ -10,6 +8,7 @@ import { EventsOn } from "../wailsjs/runtime/runtime";
 import {
   Bootstrap,
   DemoVoice,
+  EmotionPreset,
   Generated,
   GatewayModel,
   GenerationHistory,
@@ -19,10 +18,10 @@ import {
   TextReviewResult,
   VoiceProfile,
   bootstrap,
+  applyEmotionWithGateway,
+	  autoTranscribeReference,
   checkWorker,
-  consumeIncomingColabPairing,
   createVoice,
-  createVoiceFromDrop,
   deleteHistory,
   deleteVoice,
   generateVoice,
@@ -33,11 +32,15 @@ import {
   openGoogleDrive,
   openHistoryAudio,
   previewVoice,
+  readVoiceReferenceAudio,
+  readReferenceAudioSource,
   refreshVoiceLibrary,
   savePreferences,
+  selectAudioOutputDirectory,
   selectReferenceAudio,
   selectTextDocument,
   reviewTextWithGateway,
+  saveTrimmedReferenceAudio,
   TaskProgress,
 } from "./api";
 
@@ -57,15 +60,17 @@ const initialFreeGatewayModels: GatewayModel[] = [
 
 const blankBootstrap: Bootstrap = {
   app_name: "KOVA Voice Studio",
-  version: "1.0.0.9",
+  version: "",
   notebook_url: "",
-  theme: "dark",
+  theme: "light",
   locale: "vi",
   worker_url: "",
+  audio_output_dir: "",
   selected_voice_id: "",
   voices: [],
   history: [],
   demo_voices: [],
+  emotion_presets: [],
 };
 
 const scriptPresets: Record<
@@ -118,9 +123,18 @@ const text = (locale: "vi" | "en", vi: string, en: string) =>
   locale === "vi" ? vi : en;
 const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
-const isAudio = (file: File) => /\.(wav|mp3|flac)$/i.test(file.name);
+const isAudioPath = (path: string) => /\.(wav|mp3|flac)$/i.test(path);
 const safeList = <T,>(value: T[] | null | undefined): T[] =>
   Array.isArray(value) ? value : [];
+const fileDropPaths = (event: unknown): string[] => {
+  const value = (event as { data?: unknown })?.data ?? event;
+  if (Array.isArray(value)) return value.filter((path): path is string => typeof path === "string");
+  if (value && typeof value === "object") {
+    const paths = (value as { paths?: unknown }).paths;
+    if (Array.isArray(paths)) return paths.filter((path): path is string => typeof path === "string");
+  }
+  return [];
+};
 const normalizeBootstrap = (
   value: Bootstrap | null | undefined,
 ): Bootstrap => ({
@@ -129,6 +143,7 @@ const normalizeBootstrap = (
   voices: safeList(value?.voices),
   history: safeList(value?.history),
   demo_voices: safeList(value?.demo_voices),
+  emotion_presets: safeList(value?.emotion_presets),
 });
 const formatDate = (raw: string, locale: "vi" | "en") => {
   const date = new Date(raw);
@@ -156,7 +171,7 @@ export default function App() {
   const [workerURL, setWorkerURL] = useState("");
   const [token, setToken] = useState("");
   const [selectedID, setSelectedID] = useState("");
-  const [theme, setTheme] = useState("dark");
+  const [theme, setTheme] = useState("light");
   const [locale, setLocale] = useState<"vi" | "en">("vi");
   const [health, setHealth] = useState<Health | null>(null);
   const [busy, setBusy] = useState<string>("");
@@ -164,10 +179,10 @@ export default function App() {
   const [profileName, setProfileName] = useState("");
   const [profileLanguage, setProfileLanguage] = useState<"vi" | "en">("vi");
   const [referencePath, setReferencePath] = useState("");
-  const [droppedAudio, setDroppedAudio] = useState<{
-    name: string;
-    dataURL: string;
-  } | null>(null);
+  const [referenceText, setReferenceText] = useState("");
+	const [transcriptReviewed, setTranscriptReviewed] = useState(false);
+  const [referenceSource, setReferenceSource] = useState("");
+  const [trimmedReference, setTrimmedReference] = useState<string | null>(null);
   const [consent, setConsent] = useState(false);
   const [script, setScript] = useState(
     "Xin chào, đây là KOVA Voice Studio. Tôi đang đọc bằng giọng đã chọn của bạn.",
@@ -190,24 +205,28 @@ export default function App() {
   const [review, setReview] = useState<TextReviewResult | null>(null);
   const [speed, setSpeed] = useState(1);
   const [steps, setSteps] = useState(32);
+  const [emotionID, setEmotionID] = useState("neutral");
   const [output, setOutput] = useState<Generated | null>(null);
   const [libraryQuery, setLibraryQuery] = useState("");
-  const [dragging, setDragging] = useState(false);
   const [taskProgress, setTaskProgress] = useState<TaskProgress | null>(null);
   const [progressClock, setProgressClock] = useState(Date.now());
-  const fileInput = useRef<HTMLInputElement>(null);
-  const loaded = useRef(false);
+  const [loaded, setLoaded] = useState(false);
 
   const savedVoices = safeList(data?.voices);
   const history = safeList(data?.history);
   const demos = safeList(data?.demo_voices);
+  const emotionPresets = safeList(data?.emotion_presets);
+  const selectedEmotion =
+    emotionPresets.find((preset) => preset.id === emotionID) ??
+    emotionPresets[0] ??
+    null;
   const selected = savedVoices.find((voice) => voice.id === selectedID) ?? null;
 
   useEffect(() => {
-    if (loaded.current) return;
-    loaded.current = true;
+    if (loaded) return;
+    setLoaded(true);
     void loadBootstrap();
-  }, []);
+  }, [loaded]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -227,6 +246,31 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!window.go?.main?.App) return;
+    return EventsOn("wails:file-drop", async (event: unknown) => {
+      const path = fileDropPaths(event)[0];
+      if (!path) return;
+      if (!isAudioPath(path)) {
+        setNotice({
+          type: "error",
+          message: text(locale, "Chỉ nhận tệp WAV, MP3 hoặc FLAC.", "Only WAV, MP3, and FLAC files are supported."),
+        });
+        return;
+      }
+      setReferencePath(path);
+	  setReferenceText("");
+	  setTranscriptReviewed(false);
+	  setTrimmedReference(null);
+	  try { setReferenceSource(await readReferenceAudioSource(path)); } catch (error) { setNotice({ type: "error", message: messageOf(error) }); }
+      setPage("library");
+      setNotice({
+        type: "success",
+        message: text(locale, "Đã nhận audio mẫu từ File Explorer. KOVA chỉ lưu đường dẫn cho đến khi bạn tạo profile.", "Reference audio was received from File Explorer. KOVA keeps only its path until you create the profile."),
+      });
+    });
+  }, [locale]);
+
+  useEffect(() => {
     if (taskProgress?.status !== "running") return;
     const interval = window.setInterval(
       () => setProgressClock(Date.now()),
@@ -234,37 +278,6 @@ export default function App() {
     );
     return () => window.clearInterval(interval);
   }, [taskProgress?.status]);
-
-  useEffect(() => {
-    if (!window.go?.main?.App) return;
-    let active = true;
-    const claimPairing = async () => {
-      try {
-        const paired = await consumeIncomingColabPairing();
-        if (!active || !paired) return;
-        setWorkerURL(paired.worker_url);
-        setToken(paired.token);
-        setData((current) => ({ ...current, worker_url: paired.worker_url }));
-        setHealth({ reachable: true, message: paired.message });
-        setNotice({
-          type: "success",
-          message: text(
-            locale,
-            "Đã nhận kết nối một chạm từ Colab. Token chỉ giữ trong phiên này.",
-            "Connected from Colab in one click. The token is session-only.",
-          ),
-        });
-      } catch (error) {
-        if (active) setNotice({ type: "error", message: messageOf(error) });
-      }
-    };
-    void claimPairing();
-    const interval = window.setInterval(() => void claimPairing(), 1500);
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, [locale]);
 
   async function loadBootstrap() {
     try {
@@ -285,6 +298,7 @@ export default function App() {
       theme: string;
       locale: "vi" | "en";
       workerURL: string;
+      audioOutputDir: string;
       selectedID: string;
     }> = {},
   ) {
@@ -292,6 +306,7 @@ export default function App() {
       theme: next.theme ?? theme,
       locale: next.locale ?? locale,
       worker_url: next.workerURL ?? workerURL,
+      audio_output_dir: next.audioOutputDir ?? data.audio_output_dir,
       selected_voice_id: next.selectedID ?? selectedID,
     };
     const result = await savePreferences(request);
@@ -320,73 +335,58 @@ export default function App() {
     token: token.trim(),
   });
 
+  async function beginColabPairing() {
+    await run("notebook", async () => {
+      setHealth(null);
+      setToken("");
+      await saveLocalPreferences({ workerURL: "" });
+      await openColabNotebook();
+      setNotice({
+        type: "info",
+        message: text(
+          locale,
+          "Đã mở Colab. Sau khi Run all xong, sao chép KOVA_VOICE_URL và KOVA_VOICE_TOKEN ở cell cuối, dán vào hai ô trong KOVA rồi bấm Kiểm tra kết nối.",
+          "Colab is open. After Run all, copy KOVA_VOICE_URL and KOVA_VOICE_TOKEN from the final cell, paste them into KOVA, then click Check connection.",
+        ),
+      });
+    });
+  }
+
   async function chooseFile() {
     await run("choose", async () => {
       const path = await selectReferenceAudio();
       if (!path) return;
       setReferencePath(path);
-      setDroppedAudio(null);
+	  setReferenceText("");
+	  setTranscriptReviewed(false);
+	  setTrimmedReference(null);
+	  setReferenceSource(await readReferenceAudioSource(path));
     });
   }
 
-  async function acceptDrop(file?: File) {
-    if (!file) return;
-    if (!isAudio(file)) {
-      setNotice({
-        type: "error",
-        message: text(
-          locale,
-          "Chỉ nhận tệp WAV, MP3 hoặc FLAC.",
-          "Only WAV, MP3, and FLAC files are supported.",
-        ),
-      });
-      return;
-    }
-    if (file.size === 0 || file.size > 64 * 1024 * 1024) {
-      setNotice({
-        type: "error",
-        message: text(
-          locale,
-          "Audio mẫu phải nhỏ hơn 64 MiB.",
-          "The reference audio must be smaller than 64 MiB.",
-        ),
-      });
-      return;
-    }
-    const reader = new FileReader();
-    reader.onerror = () =>
-      setNotice({
-        type: "error",
-        message: text(
-          locale,
-          "Không thể đọc tệp audio mẫu.",
-          "The reference audio could not be read.",
-        ),
-      });
-    reader.onload = () => {
-      setDroppedAudio({ name: file.name, dataURL: String(reader.result) });
-      setReferencePath("");
-      setNotice({
-        type: "success",
-        message: text(
-          locale,
-          "Đã nhận audio mẫu; tệp sẽ được sao lưu riêng tư sau khi tạo profile.",
-          "Reference audio is ready and will be privately backed up after profile creation.",
-        ),
-      });
-    };
-    reader.readAsDataURL(file);
+  async function chooseAudioOutput() {
+    await run("audioOutputDirectory", async () => {
+      const directory = await selectAudioOutputDirectory();
+      if (!directory) return;
+      await saveLocalPreferences({ audioOutputDir: directory });
+      setNotice({ type: "success", message: text(locale, "Đã chọn nơi lưu audio tạo mới.", "Selected where newly generated audio is saved.") });
+    });
   }
 
-  function onDrop(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    setDragging(false);
-    void acceptDrop(event.dataTransfer.files?.[0]);
-  }
-
-  function onInputFile(event: ChangeEvent<HTMLInputElement>) {
-    void acceptDrop(event.target.files?.[0]);
-    event.target.value = "";
+  async function autoTranscribeSample() {
+    await run("transcribeReference", async () => {
+      if (!referencePath)
+        throw new Error(text(locale, "Chọn audio mẫu trước khi tạo transcript nháp.", "Choose reference audio before requesting a transcript draft."));
+      const draft = await autoTranscribeReference({
+        ...session(),
+        reference_path: referencePath,
+        reference_data_url: trimmedReference ?? "",
+        language: profileLanguage,
+      });
+      setReferenceText(draft);
+      setTranscriptReviewed(false);
+      setNotice({ type: "info", message: text(locale, "Đã nhận transcript nháp. Hãy nghe, sửa nếu cần và đánh dấu đã kiểm tra trước khi tạo profile.", "Transcript draft received. Listen, correct it if needed, then mark it reviewed before creating the profile.") });
+    });
   }
 
   async function createProfile() {
@@ -407,26 +407,22 @@ export default function App() {
             "You must confirm you have permission to use the reference audio.",
           ),
         );
+	  if (!referenceText.trim())
+		throw new Error(text(locale, "Hãy nhập đúng lời nói trong đoạn audio mẫu để OmniVoice bám theo giọng, không tự đoán lại.", "Enter the exact spoken words in the reference audio so OmniVoice does not guess them again."));
+	  if (!transcriptReviewed)
+		throw new Error(text(locale, "Hãy xác nhận rằng bạn đã xem và sửa transcript audio mẫu trước khi tạo profile.", "Confirm that you reviewed and corrected the reference transcript before creating the profile."));
       const activeSession = session();
-      let profile: VoiceProfile;
-      if (droppedAudio) {
-        profile = await createVoiceFromDrop({
-          ...activeSession,
-          name: profileName,
-          language: profileLanguage,
-          reference_base64: droppedAudio.dataURL,
-          reference_name: droppedAudio.name,
-          consent_confirmed: consent,
-        });
-      } else {
-        profile = await createVoice({
-          ...activeSession,
-          name: profileName,
-          language: profileLanguage,
-          reference_path: referencePath,
-          consent_confirmed: consent,
-        });
-      }
+	  const sourcePath = trimmedReference
+		? await saveTrimmedReferenceAudio(trimmedReference)
+		: referencePath;
+      const profile = await createVoice({
+        ...activeSession,
+        name: profileName,
+        language: profileLanguage,
+        reference_path: sourcePath,
+		  reference_text: referenceText,
+        consent_confirmed: consent,
+      });
       setData((current) => ({
         ...current,
         voices: [
@@ -441,7 +437,10 @@ export default function App() {
       await saveLocalPreferences({ selectedID: profile.id });
       setProfileName("");
       setReferencePath("");
-      setDroppedAudio(null);
+	  setReferenceText("");
+	  setTranscriptReviewed(false);
+	  setReferenceSource("");
+	  setTrimmedReference(null);
       setConsent(false);
       setNotice({
         type: "success",
@@ -478,7 +477,20 @@ export default function App() {
 
   async function checkConnection() {
     await run("health", async () => {
-      const next = await checkWorker(session());
+      const activeSession = session();
+      if (!activeSession.base_url || !activeSession.token) {
+        const next = {
+          reachable: false,
+          message: text(
+            locale,
+            "Hãy dán URL worker và token từ cell cuối của Colab trước khi kiểm tra kết nối.",
+            "Paste the worker URL and token from the final Colab cell before checking the connection.",
+          ),
+        };
+        setHealth(next);
+        throw new Error(next.message);
+      }
+      const next = await checkWorker(activeSession);
       setHealth(next);
       if (!next.reachable) throw new Error(next.message);
       setNotice({
@@ -531,6 +543,7 @@ export default function App() {
         language: selected.language,
         speed,
         steps,
+		style_prompt: selectedEmotion?.instruct ?? "",
       });
       setOutput(result);
       setNotice({
@@ -561,6 +574,7 @@ export default function App() {
         language: scriptLanguage,
         speed,
         steps,
+		style_prompt: selectedEmotion?.instruct ?? "",
       });
       setOutput(result);
       setData((current) => ({
@@ -708,26 +722,42 @@ export default function App() {
     });
   }
 
+  async function applyEmotionWithAI() {
+    await run("emotion", async () => {
+      if (!selectedEmotion)
+        throw new Error(text(locale, "Chưa có danh sách cảm xúc OmniVoice.", "No OmniVoice emotion list is available."));
+      const activeGateway =
+        gatewayMode === "catalog"
+          ? { url: gatewayURL, key: gatewayKey, model: gatewayModel }
+          : { url: customGatewayURL, key: customGatewayKey, model: customGatewayModel };
+      const result = await applyEmotionWithGateway({
+        gateway_url: activeGateway.url,
+        api_key: activeGateway.key,
+        model: activeGateway.model,
+        text: script,
+        language: scriptLanguage,
+        emotion_id: selectedEmotion.id,
+      });
+      setReview(result);
+      setNotice({
+        type: "info",
+        message: text(locale, "AI đã chuẩn bị bản đọc có cảm xúc. Hãy xem và bấm áp dụng nếu phù hợp.", "AI prepared an emotional reading. Review it and apply only if it fits."),
+      });
+    });
+  }
+
   async function createSavedVoiceSample(voice: VoiceProfile) {
     return run("voiceSample", async () => {
-      const result = await previewVoice({
-        ...session(),
-        voice_id: voice.id,
-        text: "",
-        language: voice.language,
-        speed,
-        steps,
-      });
-      setOutput(result);
+      const dataURL = await readVoiceReferenceAudio(voice.id);
       setNotice({
         type: "success",
         message: text(
           locale,
-          `Đã tạo mẫu “Xin chào” bằng giọng ${voice.name}.`,
-          `Created a “Hello” sample with ${voice.name}.`,
+          `Đang phát audio mẫu đã backup của ${voice.name}.`,
+          `Playing the backed-up reference audio for ${voice.name}.`,
         ),
       });
-      return result.data_url;
+      return dataURL;
     });
   }
 
@@ -919,7 +949,7 @@ export default function App() {
             setToken={setToken}
             health={health}
             busy={busy}
-            onOpenNotebook={() => void run("notebook", openColabNotebook)}
+            onOpenNotebook={() => void beginColabPairing()}
             onCheck={checkConnection}
             onRefresh={refreshLibrary}
             onDemo={speakDemo}
@@ -963,6 +993,10 @@ export default function App() {
             onImportComputer={importFromComputer}
             onImportDrive={importFromDrive}
             onReview={reviewWithGateway}
+			emotionPresets={emotionPresets}
+			emotionID={emotionID}
+			setEmotionID={setEmotionID}
+			onApplyEmotion={applyEmotionWithAI}
             onApplyReview={applyReview}
             onDismissReview={() => setReview(null)}
             speed={speed}
@@ -970,6 +1004,8 @@ export default function App() {
             steps={steps}
             setSteps={setSteps}
             output={output}
+			audioOutputDir={data.audio_output_dir}
+			onChooseAudioOutput={chooseAudioOutput}
             busy={busy}
             onPreview={previewSelected}
             onGenerate={generateSelected}
@@ -990,19 +1026,20 @@ export default function App() {
             profileLanguage={profileLanguage}
             setProfileLanguage={setProfileLanguage}
             referencePath={referencePath}
-            droppedAudio={droppedAudio}
+			referenceText={referenceText}
+			setReferenceText={setReferenceText}
+			transcriptReviewed={transcriptReviewed}
+			setTranscriptReviewed={setTranscriptReviewed}
+			referenceSource={referenceSource}
+			onTrimmedReference={setTrimmedReference}
             consent={consent}
             setConsent={setConsent}
             busy={busy}
-            dragging={dragging}
-            setDragging={setDragging}
-            fileInput={fileInput}
             onChoose={chooseFile}
-            onDrop={onDrop}
-            onInputFile={onInputFile}
+			onAutoTranscribe={autoTranscribeSample}
             onCreate={createProfile}
-            onOpenNotebook={() => void run("notebook", openColabNotebook)}
-            onGenerateSample={createSavedVoiceSample}
+            onOpenNotebook={() => void beginColabPairing()}
+            onReadReferenceAudio={createSavedVoiceSample}
           />
         )}
         {page === "history" && (
@@ -1037,8 +1074,37 @@ export default function App() {
             token={token}
             health={health}
             busy={busy}
+			audioOutputDir={data.audio_output_dir}
             setWorkerURL={setWorkerURL}
             setToken={setToken}
+			onChooseAudioOutput={() =>
+			  void run("audioOutputDirectory", async () => {
+				const directory = await selectAudioOutputDirectory();
+				if (!directory) return;
+				await saveLocalPreferences({ audioOutputDir: directory });
+				setNotice({
+				  type: "success",
+				  message: text(
+					locale,
+					"Đã chọn thư mục lưu audio tạo mới.",
+					"Selected the folder for newly generated audio.",
+				  ),
+				});
+			  })
+			}
+			onUsePrivateAudioOutput={() =>
+			  void run("audioOutputDirectory", async () => {
+				await saveLocalPreferences({ audioOutputDir: "" });
+				setNotice({
+				  type: "success",
+				  message: text(
+					locale,
+					"Audio tạo mới sẽ lưu trong thư mục riêng của KOVA.",
+					"New audio will be saved in KOVA's private folder.",
+				  ),
+				});
+			  })
+			}
             onSave={() =>
               void run("save", async () => {
                 await saveLocalPreferences();
@@ -1053,7 +1119,7 @@ export default function App() {
               })
             }
             onCheck={checkConnection}
-            onOpenNotebook={() => void run("notebook", openColabNotebook)}
+            onOpenNotebook={() => void beginColabPairing()}
           />
         )}
       </main>
@@ -1093,6 +1159,25 @@ function HomePage(props: {
   return (
     <div className="page-grid home-page">
       <section className="hero panel">
+        <div className="hero-flow" aria-hidden="true">
+          <svg viewBox="0 0 2880 260" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="heroWaveGradient" x1="0" x2="1">
+                <stop offset="0%" stopColor="#1775ef" />
+                <stop offset="52%" stopColor="#14b8de" />
+                <stop offset="100%" stopColor="#4e8dff" />
+              </linearGradient>
+            </defs>
+            <path
+              className="hero-wave hero-wave-main"
+              d="M0 130 Q90 62 180 130 T360 130 T540 130 T720 130 T900 130 T1080 130 T1260 130 T1440 130 T1620 130 T1800 130 T1980 130 T2160 130 T2340 130 T2520 130 T2700 130 T2880 130"
+            />
+            <path
+              className="hero-wave hero-wave-soft"
+              d="M0 130 Q90 62 180 130 T360 130 T540 130 T720 130 T900 130 T1080 130 T1260 130 T1440 130 T1620 130 T1800 130 T1980 130 T2160 130 T2340 130 T2520 130 T2700 130 T2880 130"
+            />
+          </svg>
+        </div>
         <div>
           <span className="pill">
             {text(
@@ -1123,8 +1208,8 @@ function HomePage(props: {
               ↗{" "}
               {text(
                 locale,
-                "Mở Colab để ghép một chạm",
-                "Open Colab for one-click pairing",
+                "Mở notebook Google Colab",
+                "Open Google Colab notebook",
               )}
             </button>
           </div>
@@ -1192,6 +1277,21 @@ function HomePage(props: {
               : text(locale, "Cần kết nối", "Connect")}
           </span>
         </div>
+        <div className="notice info automatic-pairing-notice">
+          {text(
+            locale,
+            "Kết nối thủ công: chạy Run all trong Colab, rồi dán KOVA_VOICE_URL và KOVA_VOICE_TOKEN từ cell cuối vào bên dưới. Token chỉ dùng cho phiên hiện tại.",
+            "Manual connection: Run all in Colab, then paste KOVA_VOICE_URL and KOVA_VOICE_TOKEN from the final cell below. The token is session-only.",
+          )}
+        </div>
+        <details className="manual-worker-config" open>
+          <summary>
+            {text(
+              locale,
+              "Dán URL worker và token từ Colab",
+              "Paste the worker URL and token from Colab",
+            )}
+          </summary>
         <div className="form-grid">
           <label>
             {text(locale, "URL worker Colab", "Colab worker URL")}
@@ -1218,10 +1318,11 @@ function HomePage(props: {
         <div className="helper">
           {text(
             locale,
-            "Khuyến nghị: mở notebook bằng nút phía trên, Run all, rồi bấm “Kết nối KOVA Voice Studio” ở cell cuối. URL và token sẽ tự vào app qua mã dùng một lần; ô nhập này chỉ là phương án dự phòng. Token không được lưu vào ổ đĩa.",
-            "Recommended: open the notebook above, Run all, then click “Connect KOVA Voice Studio” in the final cell. A one-time code sends URL and token into the app; these fields remain a fallback. The token is never saved to disk.",
+            "Mở notebook bằng nút phía trên, chọn GPU rồi Run all. Ở cell cuối, sao chép KOVA_VOICE_URL và KOVA_VOICE_TOKEN, dán vào đây, sau đó bấm Kiểm tra kết nối. Token không được lưu vào ổ đĩa.",
+            "Open the notebook above, select a GPU, and Run all. In the final cell, copy KOVA_VOICE_URL and KOVA_VOICE_TOKEN, paste them here, then click Check connection. The token is never saved to disk.",
           )}
         </div>
+        </details>
         <div className="button-row">
           <button
             className="primary"
@@ -1319,6 +1420,10 @@ function StudioPage(props: {
   onImportComputer(): void;
   onImportDrive(): void;
   onReview(): void;
+	 emotionPresets: EmotionPreset[];
+	 emotionID: string;
+	 setEmotionID(value: string): void;
+	 onApplyEmotion(): void;
   onApplyReview(): void;
   onDismissReview(): void;
   speed: number;
@@ -1326,6 +1431,8 @@ function StudioPage(props: {
   steps: number;
   setSteps(value: number): void;
   output: Generated | null;
+	 audioOutputDir: string;
+	 onChooseAudioOutput(): void;
   busy: string;
   onPreview(): void;
   onGenerate(): void;
@@ -1353,11 +1460,15 @@ function StudioPage(props: {
     customGatewayKey,
     customGatewayModel,
     review,
+	 emotionPresets,
+	 emotionID,
+	 setEmotionID,
     speed,
     setSpeed,
     steps,
     setSteps,
     output,
+	 audioOutputDir,
     busy,
   } = props;
   return (
@@ -1484,6 +1595,14 @@ function StudioPage(props: {
           )}
           {review && <div className="review-result"><strong>{text(locale, "Bản AI đề xuất", "AI suggestion")}</strong><p>{review.review_summary || text(locale, "AI đã chuẩn hóa nội dung để bạn kiểm tra.", "AI normalized the content for your review.")}</p>{review.warnings.length > 0 && <ul>{review.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul>}<textarea readOnly value={review.revised_text} aria-label={text(locale, "Bản AI đề xuất", "AI suggestion")} /><div className="button-row"><button type="button" className="primary compact" onClick={props.onApplyReview}>{text(locale, "Áp dụng bản AI", "Apply AI version")}</button><button type="button" className="secondary compact" onClick={props.onDismissReview}>{text(locale, "Giữ bản hiện tại", "Keep current version")}</button></div></div>}
         </section>
+		<section className="emotion-control" aria-label="OmniVoice vocal style">
+		  <div><strong>{text(locale, "Tông giọng", "Vocal style")}</strong><p>{text(locale, "Chỉ dẫn phong cách được gửi tới OmniVoice. Thẻ trong danh sách là những cú pháp được phép duy nhất.", "The style instruction is sent to OmniVoice. The displayed tokens are the only allowed non-verbal syntax.")}</p></div>
+		  <div className="emotion-fields">
+			<select value={emotionID} onChange={(event) => setEmotionID(event.target.value)}>{emotionPresets.map((preset) => <option value={preset.id} key={preset.id}>{locale === "vi" ? preset.label_vi : preset.label_en}</option>)}</select>
+			<button className="secondary compact" type="button" disabled={!script.trim() || busy !== ""} onClick={props.onApplyEmotion}>{busy === "emotion" ? text(locale, "Đang chuẩn bị…", "Preparing…") : text(locale, "Dùng AI chèn cảm xúc", "Use AI for emotion")}</button>
+		  </div>
+		  <details><summary>{text(locale, "Danh sách thẻ OmniVoice hợp lệ", "Allowed OmniVoice token list")}</summary><code>[laughter], [sigh], [confirmation-en], [question-en], [question-ah], [question-oh], [question-ei], [question-yi], [surprise-ah], [surprise-oh], [surprise-wa], [surprise-yo], [dissatisfaction-hnn]</code></details>
+		</section>
         <div className="control-row">
           <label>
             {text(locale, "Ngôn ngữ", "Language")}
@@ -1504,19 +1623,22 @@ function StudioPage(props: {
                 type="range"
                 min="0.7"
                 max="1.35"
-                step="0.05"
+                step="0.01"
                 value={speed}
                 onChange={(event) => setSpeed(Number(event.target.value))}
               />
+              <input className="speed-number" type="number" min="0.70" max="1.35" step="0.01" value={speed.toFixed(2)} onChange={(event) => setSpeed(Math.min(1.35, Math.max(0.7, Number(event.target.value) || 1)))} aria-label="Enter speed" />
               <span>{speed.toFixed(2)}×</span>
             </div>
           </label>
           <label>
             {text(locale, "Chất lượng", "Quality")}
+            <p className="helper">{text(locale, "Đây là số vòng giải mã (1–64), không phải phần trăm. 100 không phải mức chất lượng hợp lệ của OmniVoice.", "This is the number of decoding iterations (1–64), not a percentage. 100 is not a valid OmniVoice quality level.")}</p>
             <select
               value={steps}
               onChange={(event) => setSteps(Number(event.target.value))}
             >
+              <option value={64}>Maximum · 64</option>
               <option value={16}>Nhanh · 16</option>
               <option value={32}>Cân bằng · 32</option>
               <option value={48}>Chi tiết · 48</option>
@@ -1549,6 +1671,7 @@ function StudioPage(props: {
       <aside className="panel output-panel">
         <p className="eyebrow">OUTPUT</p>
         <h3>{text(locale, "Khu vực nghe thử", "Listening area")}</h3>
+		<div className="output-location"><small>{text(locale, "Lưu audio mới", "New audio saves to")}: {audioOutputDir || text(locale, "thư mục riêng của KOVA", "KOVA private folder")}</small><button type="button" className="link-button" disabled={busy !== ""} onClick={props.onChooseAudioOutput}>{text(locale, "Chọn nơi lưu", "Choose folder")}</button></div>
         {output?.data_url ? (
           <>
             <div className="audio-art">
@@ -1595,6 +1718,138 @@ function StudioPage(props: {
   );
 }
 
+function ReferenceTrimmer(props: {
+  source: string;
+  locale: "vi" | "en";
+  onCropChange(value: string | null): void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const audioBufferRef = useRef<AudioBuffer | null>(null);
+  const dragRef = useRef<"start" | "end" | "move" | null>(null);
+  const [duration, setDuration] = useState(0);
+  const [start, setStart] = useState(0);
+  const [end, setEnd] = useState(0);
+  const [decodeError, setDecodeError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    async function decode() {
+      try {
+        const response = await fetch(props.source);
+        const bytes = await response.arrayBuffer();
+        const context = new window.AudioContext();
+        const decoded = await context.decodeAudioData(bytes.slice(0));
+        await context.close();
+        if (cancelled) return;
+        audioBufferRef.current = decoded;
+        setDuration(decoded.duration);
+        setStart(0);
+        setEnd(Math.min(decoded.duration, 10));
+        setDecodeError("");
+      } catch {
+        if (!cancelled) setDecodeError(text(props.locale, "Trình phát không đọc được định dạng này để cắt. Hãy dùng WAV hoặc MP3, hoặc chọn đoạn đã cắt sẵn.", "This format cannot be decoded for trimming. Use WAV or MP3, or select an already trimmed clip."));
+      }
+    }
+    void decode();
+    return () => { cancelled = true; };
+  }, [props.source, props.locale]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const buffer = audioBufferRef.current;
+    if (!canvas || !buffer || duration <= 0) return;
+    const width = Math.max(1, Math.floor(canvas.clientWidth || 620));
+    const height = 104;
+    canvas.width = width * window.devicePixelRatio;
+    canvas.height = height * window.devicePixelRatio;
+    canvas.style.height = `${height}px`;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.scale(window.devicePixelRatio, window.devicePixelRatio);
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = "#f4f8ff";
+    context.fillRect(0, 0, width, height);
+    const channel = buffer.getChannelData(0);
+    const samplesPerBar = Math.max(1, Math.floor(channel.length / width));
+    context.strokeStyle = "#3f7be8";
+    context.lineWidth = 1.5;
+    context.beginPath();
+    for (let x = 0; x < width; x += 1) {
+      const from = x * samplesPerBar;
+      const until = Math.min(channel.length, from + samplesPerBar);
+      let peak = 0;
+      for (let index = from; index < until; index += 1) peak = Math.max(peak, Math.abs(channel[index] ?? 0));
+      const amplitude = Math.max(2, peak * (height * 0.45));
+      context.moveTo(x + 0.5, height / 2 - amplitude);
+      context.lineTo(x + 0.5, height / 2 + amplitude);
+    }
+    context.stroke();
+  }, [duration, start, end]);
+
+  useEffect(() => {
+    const buffer = audioBufferRef.current;
+    if (!buffer || !duration || end <= start) return;
+    if (start < 0.02 && end >= duration - 0.02) {
+      props.onCropChange(null);
+      return;
+    }
+    props.onCropChange(encodeWAVCrop(buffer, start, end));
+  }, [duration, start, end, props.onCropChange]);
+
+  const setAtPointer = (event: any, mode: "start" | "end" | "move") => {
+    if (!duration) return;
+    const rect = (event.currentTarget as HTMLDivElement).getBoundingClientRect();
+    const second = Math.max(0, Math.min(duration, ((event.clientX - rect.left) / rect.width) * duration));
+    const minimum = Math.min(3, duration);
+    if (mode === "start") setStart(Math.min(second, end - minimum));
+    if (mode === "end") setEnd(Math.max(second, start + minimum));
+    if (mode === "move") {
+      const width = end - start;
+      const nextStart = Math.max(0, Math.min(second - width / 2, duration - width));
+      setStart(nextStart);
+      setEnd(nextStart + width);
+    }
+  };
+
+  if (decodeError) return <p className="helper trim-error">{decodeError}</p>;
+  if (!duration) return <p className="helper">{text(props.locale, "Đang đọc sóng âm thanh…", "Reading waveform…")}</p>;
+  const left = `${(start / duration) * 100}%`;
+  const width = `${((end - start) / duration) * 100}%`;
+  return <section className="reference-trimmer">
+    <div className="trim-heading"><strong>{text(props.locale, "Cắt đoạn mẫu để clone", "Trim sample for cloning")}</strong><span>{start.toFixed(2)}s – {end.toFixed(2)}s · {(end - start).toFixed(2)}s</span></div>
+    <p>{text(props.locale, "Kéo hai mép khung. Chỉ đoạn nằm trong khung được gửi để clone; nên chọn một người nói, cùng ngôn ngữ, dài 3–10 giây.", "Drag the two frame edges. Only the selected segment is cloned; use one speaker, one language, for 3–10 seconds.")}</p>
+    <div className="waveform-track" onPointerMove={(event) => dragRef.current && setAtPointer(event, dragRef.current)} onPointerUp={() => { dragRef.current = null; }} onPointerLeave={() => { dragRef.current = null; }}>
+      <canvas ref={canvasRef} />
+      <div className="trim-selection" style={{ left, width }} onPointerDown={(event) => { dragRef.current = "move"; event.currentTarget.setPointerCapture(event.pointerId); }}>
+        <button type="button" className="trim-handle start" aria-label="Trim start" onPointerDown={(event) => { event.stopPropagation(); dragRef.current = "start"; }} />
+        <button type="button" className="trim-handle end" aria-label="Trim end" onPointerDown={(event) => { event.stopPropagation(); dragRef.current = "end"; }} />
+      </div>
+    </div>
+    {duration < 3 && <p className="trim-error">{text(props.locale, "Đoạn mẫu ngắn hơn 3 giây; hãy chọn file dài hơn để clone ổn định.", "The sample is shorter than 3 seconds; choose a longer file for a stable clone.")}</p>}
+  </section>;
+}
+
+function encodeWAVCrop(buffer: AudioBuffer, startSecond: number, endSecond: number) {
+  const firstSample = Math.max(0, Math.floor(startSecond * buffer.sampleRate));
+  const lastSample = Math.min(buffer.length, Math.ceil(endSecond * buffer.sampleRate));
+  const length = Math.max(1, lastSample - firstSample);
+  const channels = buffer.numberOfChannels;
+  const bytes = new ArrayBuffer(44 + length * channels * 2);
+  const view = new DataView(bytes);
+  const write = (offset: number, value: string) => Array.from(value).forEach((character, index) => view.setUint8(offset + index, character.charCodeAt(0)));
+  write(0, "RIFF"); view.setUint32(4, 36 + length * channels * 2, true); write(8, "WAVE"); write(12, "fmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, channels, true); view.setUint32(24, buffer.sampleRate, true);
+  view.setUint32(28, buffer.sampleRate * channels * 2, true); view.setUint16(32, channels * 2, true); view.setUint16(34, 16, true); write(36, "data"); view.setUint32(40, length * channels * 2, true);
+  let offset = 44;
+  for (let sample = firstSample; sample < lastSample; sample += 1) for (let channel = 0; channel < channels; channel += 1) {
+    const value = Math.max(-1, Math.min(1, buffer.getChannelData(channel)[sample] ?? 0));
+    view.setInt16(offset, value < 0 ? value * 0x8000 : value * 0x7fff, true); offset += 2;
+  }
+  const values = new Uint8Array(bytes); let binary = "";
+  values.forEach((value) => { binary += String.fromCharCode(value); });
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
 function LibraryPage(props: {
   locale: "vi" | "en";
   voices: VoiceProfile[];
@@ -1608,19 +1863,20 @@ function LibraryPage(props: {
   profileLanguage: "vi" | "en";
   setProfileLanguage(value: "vi" | "en"): void;
   referencePath: string;
-  droppedAudio: { name: string; dataURL: string } | null;
+	 referenceText: string;
+	 setReferenceText(value: string): void;
+	 transcriptReviewed: boolean;
+	 setTranscriptReviewed(value: boolean): void;
+	 referenceSource: string;
+	 onTrimmedReference(value: string | null): void;
   consent: boolean;
   setConsent(value: boolean): void;
   busy: string;
-  dragging: boolean;
-  setDragging(value: boolean): void;
-  fileInput: React.RefObject<HTMLInputElement | null>;
   onChoose(): Promise<void>;
-  onDrop(event: DragEvent<HTMLDivElement>): void;
-  onInputFile(event: ChangeEvent<HTMLInputElement>): void;
+	 onAutoTranscribe(): Promise<void>;
   onCreate(): Promise<void>;
   onOpenNotebook(): void;
-  onGenerateSample(voice: VoiceProfile): Promise<string | undefined>;
+  onReadReferenceAudio(voice: VoiceProfile): Promise<string | undefined>;
 }) {
   const {
     locale,
@@ -1633,13 +1889,14 @@ function LibraryPage(props: {
     profileLanguage,
     setProfileLanguage,
     referencePath,
-    droppedAudio,
+	 referenceText,
+	 setReferenceText,
+	 transcriptReviewed,
+	 setTranscriptReviewed,
+	 referenceSource,
     consent,
     setConsent,
     busy,
-    dragging,
-    setDragging,
-    fileInput,
   } = props;
   const players = useRef<Record<string, HTMLAudioElement>>({});
   const [samples, setSamples] = useState<Record<string, string>>({});
@@ -1663,9 +1920,9 @@ function LibraryPage(props: {
     });
     let source = samples[voice.id];
     if (!source) {
-      const generated = await props.onGenerateSample(voice);
-      if (!generated) return;
-      source = generated;
+      const referenceAudio = await props.onReadReferenceAudio(voice);
+      if (!referenceAudio) return;
+      source = referenceAudio;
       setSamples((current) => ({ ...current, [voice.id]: source }));
     }
     const player = players.current[voice.id] ?? new Audio(source);
@@ -1727,42 +1984,19 @@ function LibraryPage(props: {
             </select>
           </label>
         </div>
-        <div
-          className={`dropzone ${dragging ? "dragging" : ""}`}
-          onDragOver={(event) => {
-            event.preventDefault();
-            setDragging(true);
-          }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={props.onDrop}
-          onClick={() => fileInput.current?.click()}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(event) =>
-            event.key === "Enter" && fileInput.current?.click()
-          }
-        >
-          <input
-            ref={fileInput}
-            type="file"
-            accept=".wav,.mp3,.flac,audio/wav,audio/mpeg,audio/flac"
-            onChange={props.onInputFile}
-            hidden
-          />
+        <button className="dropzone" type="button" onClick={() => void props.onChoose()}>
           <span className="drop-icon">⇪</span>
           <strong>
-            {droppedAudio
-              ? droppedAudio.name
-              : referencePath
-                ? referencePath.split(/[\\/]/).pop()
-                : text(
-                    locale,
-                    "Kéo audio mẫu vào đây",
-                    "Drop your reference audio here",
-                  )}
+            {referencePath
+              ? referencePath.split(/[\\/]/).pop()
+              : text(
+                  locale,
+                  "Kéo audio mẫu vào đây",
+                  "Drop your reference audio here",
+                )}
           </strong>
           <p>
-            {droppedAudio || referencePath
+            {referencePath
               ? text(
                   locale,
                   "Đã chọn audio mẫu. Tệp sẽ được sao lưu vào thư viện riêng tư.",
@@ -1770,17 +2004,24 @@ function LibraryPage(props: {
                 )
               : text(
                   locale,
-                  "WAV, MP3 hoặc FLAC · tối đa 64 MiB · hoặc bấm để chọn",
-                  "WAV, MP3, or FLAC · up to 64 MiB · or click to choose",
+                  "WAV, MP3 hoặc FLAC · tối đa 64 MiB · kéo từ File Explorer hoặc bấm để chọn",
+                  "WAV, MP3, or FLAC · up to 64 MiB · drop from File Explorer or click to choose",
                 )}
           </p>
-        </div>
+        </button>
+		{referenceSource && <ReferenceTrimmer source={referenceSource} locale={locale} onCropChange={props.onTrimmedReference} />}
+		<label className="reference-transcript">
+		  <div className="transcript-heading"><strong>{text(locale, "Lời nói chính xác trong đoạn đã chọn", "Exact words in the selected clip")}</strong><button className="secondary compact" type="button" disabled={!referencePath || busy !== ""} onClick={() => void props.onAutoTranscribe()}>{busy === "transcribeReference" ? text(locale, "Đang chép lời…", "Transcribing…") : text(locale, "Tạo nháp tự động", "Auto-transcribe draft")}</button></div>
+		  <textarea value={referenceText} onChange={(event) => { setReferenceText(event.target.value.slice(0, 2000)); setTranscriptReviewed(false); }} placeholder={text(locale, "Nhập đúng những gì người nói đã đọc. Bạn là người duyệt cuối; app không tự dùng transcript đoán lại.", "Type exactly what the speaker says. You are the final reviewer; the app will not silently use a guessed transcript.")} />
+		  <small>{text(locale, "Tự chép lời chỉ là nháp. Bắt buộc nghe lại và sửa trước khi xác nhận; transcript chuẩn ngăn đầu câu lặp lại lời trong audio mẫu.", "Auto-transcription is only a draft. Listen and correct it before confirming; the exact transcript prevents reference words from bleeding into new audio.")}</small>
+		  <span className="consent transcript-confirm"><input type="checkbox" checked={transcriptReviewed} onChange={(event) => setTranscriptReviewed(event.target.checked)} /><span>{text(locale, "Tôi đã nghe, xem và sửa transcript đúng với đoạn audio đã chọn.", "I listened to, reviewed, and corrected this transcript for the selected clip.")}</span></span>
+		</label>
         <div className="separation-note">
           <span>✦</span>
           <div><strong>{text(locale, "Làm sạch audio tham chiếu bằng GPU", "GPU reference cleanup")}</strong><p>{text(locale, "Bắt buộc: Colab dùng Demucs tách giọng nói khỏi nhạc trước khi OmniVoice tạo clone. Nếu không tách được, app dừng để tránh lưu một profile lẫn nhạc.", "Required: Colab uses Demucs to isolate speech from music before OmniVoice creates the clone. If cleanup fails, KOVA stops instead of saving a music-contaminated profile.")}</p></div>
         </div>
         <button className="file-button" onClick={() => void props.onChoose()}>
-          {referencePath || droppedAudio
+          {referencePath
             ? text(locale, "Chọn audio khác", "Choose another audio")
             : text(locale, "Chọn tệp audio", "Choose audio file")}
         </button>
@@ -1813,7 +2054,7 @@ function LibraryPage(props: {
         </div>
         <button
           className="primary full"
-          disabled={busy !== "" || (!referencePath && !droppedAudio)}
+          disabled={busy !== "" || !referencePath || !referenceText.trim() || !transcriptReviewed}
           onClick={() => void props.onCreate()}
         >
           ✦{" "}
@@ -1883,8 +2124,8 @@ function LibraryPage(props: {
                   <button
                     className={`sample-toggle ${playingVoiceID === voice.id ? "playing" : ""}`}
                     type="button"
-                    aria-label={text(locale, "Phát hoặc dừng mẫu Xin chào", "Play or pause the Hello sample")}
-                    title={text(locale, "Nghe mẫu Xin chào", "Play Hello sample")}
+                    aria-label={text(locale, "Phát hoặc dừng audio mẫu đã backup", "Play or pause the backed-up reference audio")}
+                    title={text(locale, "Nghe audio mẫu đã backup", "Play backed-up reference audio")}
                     disabled={busy !== ""}
                     onClick={() => void toggleVoiceSample(voice)}
                   >
@@ -2014,8 +2255,11 @@ function SettingsPage(props: {
   token: string;
   health: Health | null;
   busy: string;
+	audioOutputDir: string;
   setWorkerURL(value: string): void;
   setToken(value: string): void;
+	onChooseAudioOutput(): void;
+	onUsePrivateAudioOutput(): void;
   onSave(): void;
   onCheck(): void;
   onOpenNotebook(): void;
@@ -2029,6 +2273,7 @@ function SettingsPage(props: {
     token,
     health,
     busy,
+	audioOutputDir,
     setWorkerURL,
     setToken,
   } = props;
@@ -2048,8 +2293,8 @@ function SettingsPage(props: {
         <p>
           {text(
             locale,
-            "KOVA Voice Studio là app desktop; Colab chỉ cung cấp GPU cho model clone. Dán URL và token mỗi khi bạn muốn kết nối phiên worker đó.",
-            "KOVA Voice Studio is a desktop app; Colab only supplies GPU for the clone model. Paste the URL and token whenever you want to connect to that worker session.",
+            "KOVA Voice Studio là app desktop; Colab chỉ cung cấp GPU cho model clone. Sau khi Run all, dán URL worker và token ở cell cuối vào hai ô bên dưới để kết nối phiên hiện tại.",
+            "KOVA Voice Studio is a desktop app; Colab only supplies GPU for the clone model. After Run all, paste the worker URL and token from the final cell below to connect the current session.",
           )}
         </p>
         <label>
@@ -2072,8 +2317,8 @@ function SettingsPage(props: {
             onChange={(event) => setToken(event.target.value)}
             placeholder={text(
               locale,
-              "Dán token từ cell Colab",
-              "Paste token from the Colab cell",
+              "Dán token từ cell cuối Colab",
+              "Paste the token from the final Colab cell",
             )}
           />
         </label>
@@ -2138,6 +2383,31 @@ function SettingsPage(props: {
           <span className="check-chip">
             ✓ {text(locale, "Được lưu", "Saved")}
           </span>
+        </div>
+        <div className="setting-item audio-output-setting">
+          <div>
+            <strong>{text(locale, "Thư mục lưu audio", "Audio output folder")}</strong>
+            <p>
+              {text(
+                locale,
+                "Audio tạo mới được lưu trực tiếp vào thư mục này. Các mục lịch sử cũ vẫn giữ vị trí đã lưu ban đầu.",
+                "New audio is saved directly in this folder. Existing history keeps the location where it was originally saved.",
+              )}
+            </p>
+            <code className="output-path">
+              {audioOutputDir || text(locale, "Thư mục riêng của KOVA", "KOVA private folder")}
+            </code>
+          </div>
+          <div className="audio-output-actions">
+            <button className="secondary" type="button" disabled={busy !== ""} onClick={props.onChooseAudioOutput}>
+              {text(locale, "Chọn thư mục", "Choose folder")}
+            </button>
+            {audioOutputDir && (
+              <button className="link-button" type="button" disabled={busy !== ""} onClick={props.onUsePrivateAudioOutput}>
+                {text(locale, "Dùng mặc định", "Use default")}
+              </button>
+            )}
+          </div>
         </div>
         <div className="setting-item">
           <div>
