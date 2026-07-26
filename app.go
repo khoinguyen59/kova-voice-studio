@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	voiceStudioNotebookURL  = "https://colab.research.google.com/github/khoinguyen59/kova-video-dubbing/blob/main/voice-studio/notebooks/Kova_Voice_Studio_GPU.ipynb"
+	voiceStudioNotebookURL  = "https://colab.research.google.com/github/khoinguyen59/kova-voice-studio/blob/master/worker/notebooks/Kova_Voice_Studio_GPU.ipynb"
 	maxReferenceBytes       = int64(64 * 1024 * 1024)
 	maxGenerationBytes      = int64(32 * 1024 * 1024)
 	maxDocumentBytes        = int64(12 * 1024 * 1024)

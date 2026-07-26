@@ -1826,6 +1826,7 @@ function ReferenceTrimmer(props: {
       </div>
     </div>
     {duration < 3 && <p className="trim-error">{text(props.locale, "Đoạn mẫu ngắn hơn 3 giây; hãy chọn file dài hơn để clone ổn định.", "The sample is shorter than 3 seconds; choose a longer file for a stable clone.")}</p>}
+    {end - start > 10 && <p className="trim-warning">{text(props.locale, "Đoạn đã chọn dài hơn 10 giây. OmniVoice có thể clone kém ổn định hơn; hãy thu ngắn về 3–10 giây.", "The selected clip is longer than 10 seconds. OmniVoice may clone less reliably; trim it to 3–10 seconds.")}</p>}
   </section>;
 }
 

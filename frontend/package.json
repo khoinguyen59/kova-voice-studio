@@ -1,7 +1,7 @@
 {
   "name": "kova-voice-studio-ui",
   "private": true,
-  "version": "1.0.1-8",
+  "version": "1.0.1-9",
   "type": "module",
   "scripts": {
     "dev": "vite",

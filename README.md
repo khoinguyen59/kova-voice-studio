@@ -1,10 +1,10 @@
 # KOVA Voice Studio
 
-KOVA Voice Studio is a Windows desktop client for creating and reusing consented voice-clone profiles on a user-controlled KOVA Voice Studio GPU worker. It is independent from KOVA Video Localization Studio.
+KOVA Voice Studio is a self-contained Windows project for creating and reusing consented voice-clone profiles. The desktop app, OmniVoice worker source, worker tests, and Google Colab notebook live in this repository; it does not require the former `kova-video-dubbing` worker repository.
 
 ## Run the packaged app
 
-The production executable is written directly to `build/KOVA-Voice-Studio-<version>.exe`; for this release it is `build/KOVA-Voice-Studio-1.0.1.8.exe`. On Windows, open it directly; WebView2 is required (it is normally included with current Windows installations).
+The production executable is written directly to `build/KOVA-Voice-Studio-<version>.exe`; for this release it is `build/KOVA-Voice-Studio-1.0.1.9.exe`. On Windows, open it directly; WebView2 is required (it is normally included with current Windows installations).
 
 ## First connection
 
@@ -23,6 +23,12 @@ The published notebook prints the worker URL and session token; it does not call
 - TXT, SRT, MD, DOCX, PDF, and Google Drive document import.
 - Optional OpenAI-compatible Gateway review. Only models with explicit numeric zero pricing are labelled free.
 - Native Windows file picker and drag-and-drop support without encoding whole files into the web UI.
+- Reviewed reference transcript, optional auto-transcription draft, horizontal waveform trimming, and cached OmniVoice conditioning.
+- Emotion-style selector, documented OmniVoice token list, and constrained AI Gateway editing.
+
+## Embedded GPU worker
+
+The complete worker is under [`worker/`](worker/). It is versioned and tested with the desktop app in this repository. Its Colab notebook installs OmniVoice, Demucs, and the optional transcription model, then starts a session-only authenticated worker. It is intentionally not bundled into the `.exe`: OmniVoice requires a large model and a CUDA-capable runtime. The repository is self-contained; the user chooses whether that runtime is Google Colab or their own compatible GPU machine.
 
 ## Privacy and storage
 

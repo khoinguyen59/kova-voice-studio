@@ -250,6 +250,15 @@ func TestAutoTranscribeReferenceReturnsAnEditableDraft(t *testing.T) {
 	}
 }
 
+func TestColabNotebookIsHostedWithTheDesktopProject(t *testing.T) {
+	if !strings.Contains(voiceStudioNotebookURL, "khoinguyen59/kova-voice-studio/blob/master/worker/notebooks/") {
+		t.Fatalf("notebook must be embedded in this repository: %s", voiceStudioNotebookURL)
+	}
+	if strings.Contains(voiceStudioNotebookURL, "kova-video-dubbing") {
+		t.Fatalf("desktop must not depend on the former worker repository: %s", voiceStudioNotebookURL)
+	}
+}
+
 func TestMissingReferenceIsReportedAsUnavailableWithoutLosingProfile(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("KOVA_VOICE_STUDIO_DATA_DIR", dataDir)
