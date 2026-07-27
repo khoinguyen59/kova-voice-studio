@@ -19,9 +19,11 @@ import {
   VoiceProfile,
   bootstrap,
   applyEmotionWithGateway,
-	  autoTranscribeReference,
+  autoTranscribeReference,
+	cancelWorkerJob,
   checkWorker,
   createVoice,
+	debugLogLocation,
   deleteHistory,
   deleteVoice,
   generateVoice,
@@ -114,7 +116,7 @@ const scriptPresets: Record<
       label: "Long",
       hint: "~2 minutes",
       value:
-        "Hello, this is a longer listening test for evaluating the stability of a generated voice. KOVA Voice Studio separates speech from music in the reference recording before it creates a clone profile. That keeps the generated result focused on the speaker's pronunciation and rhythm instead of reproducing background music.\n\nIn the Studio, the saved profile is reused for every audio generation. You can edit the script, tune the speed, ask an AI Gateway to review spelling, punctuation, context, and logic, then listen before exporting. Each AI change remains under your review, so the original wording is never silently replaced.\n\nA longer test also reveals unnatural pauses, proper names that should remain unchanged, and sentences that need to be split. After listening, adjust the script as you wish and generate again. The voice profile stays in your private library for fast reuse next time.",
+        "Hello, this is a longer listening test for evaluating the stability of a generated voice. A clean, spoken three-to-ten second reference helps KOVA Voice Studio preserve pronunciation and rhythm. If the reference contains music, enable vocal cleanup before creating the profile.\n\nIn the Studio, the saved profile is reused for every audio generation. You can edit the script, tune the speed, ask an AI Gateway to review spelling, punctuation, context, and logic, then listen before exporting. Each AI change remains under your review, so the original wording is never silently replaced.\n\nA longer test also reveals unnatural pauses, proper names that should remain unchanged, and sentences that need to be split. After listening, adjust the script as you wish and generate again. The voice profile stays in your private library for fast reuse next time.",
     },
   },
 };
@@ -183,6 +185,7 @@ export default function App() {
 	const [transcriptReviewed, setTranscriptReviewed] = useState(false);
   const [referenceSource, setReferenceSource] = useState("");
   const [trimmedReference, setTrimmedReference] = useState<string | null>(null);
+  const [separateMusic, setSeparateMusic] = useState(false);
   const [consent, setConsent] = useState(false);
   const [script, setScript] = useState(
     "Xin chào, đây là KOVA Voice Studio. Tôi đang đọc bằng giọng đã chọn của bạn.",
@@ -209,6 +212,7 @@ export default function App() {
   const [output, setOutput] = useState<Generated | null>(null);
   const [libraryQuery, setLibraryQuery] = useState("");
   const [taskProgress, setTaskProgress] = useState<TaskProgress | null>(null);
+  const [debugLogPath, setDebugLogPath] = useState("");
   const [progressClock, setProgressClock] = useState(Date.now());
   const [loaded, setLoaded] = useState(false);
 
@@ -261,7 +265,12 @@ export default function App() {
 	  setReferenceText("");
 	  setTranscriptReviewed(false);
 	  setTrimmedReference(null);
-	  try { setReferenceSource(await readReferenceAudioSource(path)); } catch (error) { setNotice({ type: "error", message: messageOf(error) }); }
+	  try {
+		setReferenceSource(await readReferenceAudioSource(path));
+	  } catch (error) {
+		setNotice({ type: "error", message: messageOf(error) });
+		return;
+	  }
       setPage("library");
       setNotice({
         type: "success",
@@ -288,8 +297,14 @@ export default function App() {
       setSelectedID(normalized.selected_voice_id);
       setTheme(normalized.theme);
       setLocale(normalized.locale);
+		try {
+			setDebugLogPath(await debugLogLocation());
+		} catch {
+			// A development build may be paired with an older backend. It can still
+			// show the original bootstrap result without a local log-path hint.
+		}
     } catch (error) {
-      setNotice({ type: "error", message: messageOf(error) });
+		setNotice({ type: "error", message: messageOf(error) });
     }
   }
 
@@ -324,7 +339,10 @@ export default function App() {
     try {
       return await task();
     } catch (error) {
-      setNotice({ type: "error", message: messageOf(error) });
+		const diagnostic = debugLogPath
+			? text(locale, `\nNhật ký chẩn đoán: ${debugLogPath}`, `\nDiagnostic log: ${debugLogPath}`)
+			: "";
+      setNotice({ type: "error", message: messageOf(error) + diagnostic });
     } finally {
       setBusy("");
     }
@@ -422,6 +440,7 @@ export default function App() {
         reference_path: sourcePath,
 		  reference_text: referenceText,
         consent_confirmed: consent,
+		  separate_music: separateMusic,
       });
       setData((current) => ({
         ...current,
@@ -441,6 +460,7 @@ export default function App() {
 	  setTranscriptReviewed(false);
 	  setReferenceSource("");
 	  setTrimmedReference(null);
+	  setSeparateMusic(false);
       setConsent(false);
       setNotice({
         type: "success",
@@ -481,6 +501,9 @@ export default function App() {
       if (!activeSession.base_url || !activeSession.token) {
         const next = {
           reachable: false,
+		  ready: false,
+		  busy: false,
+		  queue_depth: 0,
           message: text(
             locale,
             "Hãy dán URL worker và token từ cell cuối của Colab trước khi kiểm tra kết nối.",
@@ -722,6 +745,16 @@ export default function App() {
     });
   }
 
+  async function cancelActiveWorkerJob() {
+	const jobID = taskProgress?.job_id;
+	await run("cancel", async () => {
+		if (!jobID)
+			throw new Error(text(locale, "Tác vụ này chưa có mã job để hủy.", "This task has no worker job ID to cancel."));
+		await cancelWorkerJob(session(), jobID);
+		setNotice({ type: "info", message: text(locale, "Đã gửi yêu cầu hủy. GPU sẽ hoàn tất bước hiện tại rồi bỏ kết quả.", "Cancellation requested. The GPU will finish its current step and discard the result.") });
+	});
+  }
+
   async function applyEmotionWithAI() {
     await run("emotion", async () => {
       if (!selectedEmotion)
@@ -748,7 +781,7 @@ export default function App() {
 
   async function createSavedVoiceSample(voice: VoiceProfile) {
     return run("voiceSample", async () => {
-      const dataURL = await readVoiceReferenceAudio(voice.id);
+      const dataURL = await readVoiceReferenceAudio(session(), voice.id);
       setNotice({
         type: "success",
         message: text(
@@ -934,6 +967,7 @@ export default function App() {
             progress={taskProgress}
             clock={progressClock}
             locale={locale}
+			onCancel={taskProgress.status === "running" && taskProgress.job_id ? () => void cancelActiveWorkerJob() : undefined}
           />
         )}
 
@@ -1032,6 +1066,8 @@ export default function App() {
 			setTranscriptReviewed={setTranscriptReviewed}
 			referenceSource={referenceSource}
 			onTrimmedReference={setTrimmedReference}
+			separateMusic={separateMusic}
+			setSeparateMusic={setSeparateMusic}
             consent={consent}
             setConsent={setConsent}
             busy={busy}
@@ -1954,6 +1990,8 @@ function LibraryPage(props: {
 	 setTranscriptReviewed(value: boolean): void;
 	 referenceSource: string;
 	 onTrimmedReference(value: string | null): void;
+  separateMusic: boolean;
+  setSeparateMusic(value: boolean): void;
   consent: boolean;
   setConsent(value: boolean): void;
   busy: string;
@@ -1979,6 +2017,8 @@ function LibraryPage(props: {
 	 transcriptReviewed,
 	 setTranscriptReviewed,
 	 referenceSource,
+	  separateMusic,
+	  setSeparateMusic,
     consent,
     setConsent,
     busy,
@@ -2102,8 +2142,12 @@ function LibraryPage(props: {
 		  <span className="consent transcript-confirm"><input type="checkbox" checked={transcriptReviewed} onChange={(event) => setTranscriptReviewed(event.target.checked)} /><span>{text(locale, "Tôi đã nghe, xem và sửa transcript đúng với đoạn audio đã chọn.", "I listened to, reviewed, and corrected this transcript for the selected clip.")}</span></span>
 		</label>
         <div className="separation-note">
+		  <label className="separation-toggle">
+			<input type="checkbox" checked={separateMusic} onChange={(event) => setSeparateMusic(event.target.checked)} />
+			<span>{text(locale, "Có nhạc nền", "Contains music")}</span>
+		  </label>
           <span>✦</span>
-          <div><strong>{text(locale, "Làm sạch audio tham chiếu bằng GPU", "GPU reference cleanup")}</strong><p>{text(locale, "Bắt buộc: Colab dùng Demucs tách giọng nói khỏi nhạc trước khi OmniVoice tạo clone. Nếu không tách được, app dừng để tránh lưu một profile lẫn nhạc.", "Required: Colab uses Demucs to isolate speech from music before OmniVoice creates the clone. If cleanup fails, KOVA stops instead of saving a music-contaminated profile.")}</p></div>
+          <div><strong>{text(locale, "Làm sạch audio tham chiếu bằng GPU", "GPU reference cleanup")}</strong><p>{text(locale, "Chỉ bật khi audio có nhạc nền hoặc tiếng ồn mạnh. Demucs tách vocal trước khi clone; chậm hơn nhưng giảm nguy cơ lẫn nhạc. Với giọng nói sạch, để tắt để giữ chất lượng gốc.", "Enable only for music or heavy background noise. Demucs isolates vocals before cloning; it is slower but reduces music bleed. Leave it off for a clean spoken recording.")}</p></div>
         </div>
         <button className="file-button" onClick={() => void props.onChoose()}>
           {referencePath
@@ -2525,8 +2569,9 @@ function TaskProgressPanel(props: {
   progress: TaskProgress;
   clock: number;
   locale: "vi" | "en";
+	  onCancel?: () => void;
 }) {
-  const { progress, clock, locale } = props;
+  const { progress, clock, locale, onCancel } = props;
   const started = Date.parse(progress.started_at);
   const elapsed =
     progress.status === "running" && !Number.isNaN(started)
@@ -2550,7 +2595,7 @@ function TaskProgressPanel(props: {
         <p className="eyebrow">THEO DÕI TÁC VỤ</p>
         <h3>{title}</h3>
       </div>
-      <span className="task-status">{status}</span>
+	  <div className="task-actions"><span className="task-status">{status}</span>{onCancel && <button type="button" className="link-button" onClick={onCancel}>{text(locale, "Hủy tác vụ", "Cancel task")}</button>}</div>
       <div className="progress-meta">
         <span>
           {Math.max(0, Math.min(100, progress.percent))}% ·{" "}

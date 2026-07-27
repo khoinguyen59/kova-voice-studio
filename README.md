@@ -4,7 +4,7 @@ KOVA Voice Studio is a self-contained Windows project for creating and reusing c
 
 ## Run the packaged app
 
-The production executable is written directly to `build/KOVA-Voice-Studio-<version>.exe`; for this release it is `build/KOVA-Voice-Studio-1.0.2.0.exe`. On Windows, open it directly; WebView2 is required (it is normally included with current Windows installations).
+The production executable is written directly to `build/KOVA-Voice-Studio-<version>.exe`; for this release it is `build/KOVA-Voice-Studio-1.0.2.1.exe`. On Windows, open it directly; WebView2 is required (it is normally included with current Windows installations).
 
 ## First connection
 
@@ -47,7 +47,11 @@ npm run typecheck
 npm run build
 cd ..
 go test ./... -count=1
-wails build -clean
+# Commit and push the release source, then create and push the matching tag:
+git tag v1.0.2.1
+git push origin master --follow-tags
+# Only then build the final EXE:
+.\scripts\build-release.ps1
 ```
 
-The packaging hook moves the executable from Wails' temporary `build/bin/` directory to `build/KOVA-Voice-Studio-<version>.exe`. Release versions use four numeric components: after `1.0.1.4` comes `1.0.1.5`; after `1.0.1.9` comes `1.0.2.0` (never `1.0.1.10`). The source excludes user data, build output, Node modules, and local tool caches.
+The packaging hook moves the executable from Wails' temporary `build/bin/` directory to `build/KOVA-Voice-Studio-<version>.exe`. Release versions use four numeric components: after `1.0.1.4` comes `1.0.1.5`; after `1.0.1.9` comes `1.0.2.0` (never `1.0.1.10`). Before a release build, commit and push the exact source revision **and its matching `v<version>` tag** to GitHub; both scripts refuse to build/package when either check is missing. The release notebook then opens that exact tag instead of a moving branch. The source excludes user data, build output, Node modules, and local tool caches.

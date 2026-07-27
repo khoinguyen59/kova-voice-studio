@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from io import BytesIO
+import json
 import os
 from pathlib import Path
 import re
@@ -19,7 +20,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .engine import engine
-from .store import ProfileStore
+from .jobs import JobContext, JobQueue
+from .store import ProfileStore, WorkerJob
 
 
 class CreateProfileRequest(BaseModel):
@@ -31,6 +33,15 @@ class CreateProfileRequest(BaseModel):
     consent: bool
     engine: str = "omnivoice"
     engine_version: str = "pending"
+
+
+class GenerationJobRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=10_000)
+    profile_id: str = Field(min_length=1, max_length=128)
+    language: str = "vi"
+    speed: float = Field(default=1.0, gt=0, le=2.0)
+    num_step: int = Field(default=32, ge=1, le=64)
+    duration: float | None = Field(default=None, gt=0)
 
 
 MAX_REFERENCE_BYTES = 256 * 1024 * 1024
@@ -46,28 +57,146 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     if path.suffix != ".db":
         path = path / "voice-studio.db"
     store = ProfileStore(path)
-    app = FastAPI(title="KOVA Voice Studio", version="1.0.0")
+    work_root = path.parent
+    jobs = JobQueue(store, work_root / "jobs")
+    app = FastAPI(title="KOVA Voice Studio", version="1.0.2.1")
     app.state.profile_store = store
+    app.state.job_queue = jobs
     pairing_lock = Lock()
     pairing_claimed = False
 
     def require_token(request: Request) -> None:
         expected = os.environ.get("KOVA_VOICE_API_TOKEN", "").strip()
         if not expected:
-            return
+            # Tests and explicitly opted-in local development can run without a
+            # token. A Colab tunnel must never become public without one.
+            if os.environ.get("KOVA_VOICE_ALLOW_UNAUTHENTICATED_LOCAL") == "1" or os.environ.get("PYTEST_CURRENT_TEST"):
+                return
+            raise HTTPException(status_code=503, detail="worker token is not configured")
         authorization = request.headers.get("Authorization", "")
-        if authorization != f"Bearer {expected}":
+        if not secrets.compare_digest(authorization, f"Bearer {expected}"):
             raise HTTPException(status_code=401, detail="invalid worker token")
 
     def health_payload() -> dict[str, object]:
         return {
             "status": "ready" if engine.ready() else "installed",
-            "ready": True,
+            "ready": engine.ready(),
             "device": engine.device,
             "dtype": engine.dtype,
-            "api_version": "1.0",
+            "api_version": "2.0",
+            "protocol_min": "1.0",
+            "protocol_max": "2.0",
+            "queue_depth": jobs.queue_depth,
+            "busy": jobs.busy,
             "name": "KOVA Voice Studio",
         }
+
+    def job_payload(job: WorkerJob) -> dict[str, object]:
+        result: object = None
+        if job.result_json:
+            try:
+                result = json.loads(job.result_json)
+            except json.JSONDecodeError:
+                result = None
+        payload: dict[str, object] = {
+            "id": job.id,
+            "kind": job.kind,
+            "status": job.status,
+            "stage": job.stage,
+            "percent": job.percent,
+            "message": job.message,
+            "cancel_requested": job.cancel_requested,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "result": result,
+        }
+        if job.error_code:
+            error: dict[str, object] = {
+                "code": job.error_code,
+                "message": public_job_error(job.error_code),
+                "retryable": job.error_code in {"queue_full", "worker_failed", "worker_restarted"},
+                "request_id": job.id,
+            }
+            if os.environ.get("KOVA_VOICE_DEBUG") == "1":
+                error["debug_detail"] = job.error_detail
+            payload["error"] = error
+        return payload
+
+    def create_profile_result(
+        context: JobContext,
+        *,
+        name: str,
+        language: str,
+        reference_text: str,
+        source_path: Path,
+        separate_music: bool,
+    ) -> tuple[dict[str, object], str]:
+        context.update("validate_reference", 12, "validating reference audio")
+        blob = source_path.read_bytes()
+        safe_name = SAFE_FILENAME.sub("_", source_path.name).strip("._") or "reference.wav"
+        context.check_cancelled()
+        context.update("prepare_reference", 30, "preparing the selected reference")
+        clean_blob, clean_filename = vocal_only_reference(
+            blob, safe_name, work_root, separate_music=separate_music
+        )
+        duration_seconds = reference_duration_seconds(clean_blob)
+        if duration_seconds < MIN_REFERENCE_SECONDS or duration_seconds > MAX_REFERENCE_SECONDS:
+            raise ValueError(
+                f"reference audio must be between {MIN_REFERENCE_SECONDS:g} and {MAX_REFERENCE_SECONDS:g} seconds"
+            )
+        digest = hashlib.sha256(clean_blob).hexdigest()
+        context.check_cancelled()
+        context.update("store_reference", 58, "saving worker-owned reference")
+        profile, version = store.create_profile(
+            name=name,
+            language=language,
+            reference_filename=clean_filename,
+            reference_sha256=digest,
+            reference_path="",
+            reference_duration_seconds=duration_seconds,
+            reference_text=reference_text,
+            consent=True,
+            engine="omnivoice",
+            engine_version=os.environ.get("KOVA_OMNIVOICE_MODEL", "k2-fsa/OmniVoice"),
+        )
+        reference_path = work_root / "references" / profile.id / version.id / clean_filename
+        temporary_path = reference_path.with_suffix(reference_path.suffix + ".part")
+        try:
+            reference_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_bytes(clean_blob)
+            temporary_path.replace(reference_path)
+            store.set_reference_path(version.id, str(reference_path))
+            version = store.latest_version(profile.id)
+            assert version is not None
+            context.check_cancelled()
+            if os.environ.get("KOVA_VOICE_PREPARE_PROFILE_PROMPT", "0") == "1":
+                context.update("prepare_prompt", 78, "preparing OmniVoice clone prompt")
+                engine.prepare_voice_clone_prompt(
+                    profile_id=profile.id,
+                    reference_audio=version.reference_path,
+                    reference_text=version.reference_text,
+                    language=profile.language,
+                )
+            context.update("complete_profile", 96, "profile is ready")
+            # A cancellation can arrive while the prompt is being prepared. Check
+            # once more before exposing the profile; the exception cleanup below
+            # removes both metadata and the worker-owned reference.
+            context.check_cancelled()
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            reference_path.unlink(missing_ok=True)
+            for owned_path in store.delete_profile(profile.id):
+                Path(owned_path).unlink(missing_ok=True)
+            engine.drop_voice_clone_prompt(profile.id)
+            raise
+        finally:
+            source_path.unlink(missing_ok=True)
+        profile_payload = profile.__dict__ | {
+            "reference_clean": separate_music,
+            "reference_processing": "demucs_cuda_vocals" if separate_music else "none",
+            "voice_clone_prompt_ready": engine.has_voice_clone_prompt(profile.id),
+        }
+        return {"id": profile.id, "profile": profile_payload, "version": safe_version(version)}, ""
 
     @app.get("/health", dependencies=[Depends(require_token)])
     @app.get("/v1/health", dependencies=[Depends(require_token)])
@@ -84,9 +213,122 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             "reference_audio_max_seconds": MAX_REFERENCE_SECONDS,
             "sample_rate_hz": 24000,
             "formats": ["wav", "mp3", "flac"],
-            "reference_vocal_separation": os.environ.get("KOVA_VOICE_SEPARATE_REFERENCE", "") == "1",
-            "auto_reference_transcript": True,
+            "reference_vocal_separation": True,
+            "auto_reference_transcript": transcription_available(),
         }
+
+    @app.post("/v2/jobs/profile", status_code=202, dependencies=[Depends(require_token)])
+    def create_profile_job(
+        name: str = Form(...),
+        consent_confirmed: bool = Form(False),
+        ref_text: str = Form(""),
+        language: str = Form("vi"),
+        separate_music: bool = Form(False),
+        ref_audio: UploadFile = File(...),
+    ) -> dict[str, object]:
+        if not consent_confirmed:
+            raise HTTPException(status_code=422, detail="voice consent is required")
+        reference_text = " ".join(ref_text.split())
+        if not reference_text or len(reference_text) > 2_000:
+            raise HTTPException(status_code=422, detail="an exact reference transcript of at most 2,000 characters is required")
+        source = stage_upload(ref_audio, work_root / "uploads")
+
+        def handler(context: JobContext) -> tuple[dict[str, object], str]:
+            return create_profile_result(
+                context,
+                name=name,
+                language=language,
+                reference_text=reference_text,
+                source_path=source,
+                separate_music=separate_music,
+            )
+
+        job = jobs.submit("profile", "reference upload is waiting for the GPU", handler)
+        if job.status == "failed":
+            source.unlink(missing_ok=True)
+            raise HTTPException(status_code=429, detail="the Colab GPU queue is full; retry after a task finishes")
+        return job_payload(job)
+
+    @app.post("/v2/jobs/transcription", status_code=202, dependencies=[Depends(require_token)])
+    def transcribe_reference_job(
+        language: str = Form("vi"), ref_audio: UploadFile = File(...)
+    ) -> dict[str, object]:
+        source = stage_upload(ref_audio, work_root / "uploads")
+
+        def handler(context: JobContext) -> tuple[dict[str, object], str]:
+            try:
+                context.update("transcribe", 35, "transcribing the selected reference")
+                context.check_cancelled()
+                transcript = auto_transcribe_reference(source.read_bytes(), source.name, language)
+                context.check_cancelled()
+                return {"text": transcript}, ""
+            finally:
+                source.unlink(missing_ok=True)
+
+        job = jobs.submit("transcription", "transcription is waiting for the GPU", handler)
+        if job.status == "failed":
+            source.unlink(missing_ok=True)
+            raise HTTPException(status_code=429, detail="the Colab GPU queue is full; retry after a task finishes")
+        return job_payload(job)
+
+    @app.post("/v2/jobs/generation", status_code=202, dependencies=[Depends(require_token)])
+    def generate_job(request: GenerationJobRequest) -> dict[str, object]:
+        version = store.latest_version(request.profile_id)
+        if version is None or not version.reference_path or not Path(version.reference_path).is_file():
+            raise HTTPException(status_code=404, detail="voice profile reference was not found")
+
+        def handler(context: JobContext) -> tuple[dict[str, object], str]:
+            context.update("generate", 35, "OmniVoice is generating audio")
+            context.check_cancelled()
+            audio = engine.synthesize(
+                text=request.text.strip(),
+                reference_audio=version.reference_path,
+                reference_text=version.reference_text,
+                profile_id=request.profile_id,
+                language=request.language,
+                instruct="",
+                speed=request.speed,
+                duration=request.duration,
+                num_steps=request.num_step,
+            )
+            context.check_cancelled()
+            context.update("save_audio", 88, "saving generated audio")
+            result_dir = work_root / "jobs"
+            result_dir.mkdir(parents=True, exist_ok=True)
+            result_path = result_dir / f"{context.job_id}.wav"
+            temporary_path = result_path.with_suffix(".wav.part")
+            temporary_path.write_bytes(audio)
+            temporary_path.replace(result_path)
+            return {"media_type": "audio/wav", "size_bytes": len(audio)}, str(result_path)
+
+        job = jobs.submit("generation", "generation is waiting for the GPU", handler)
+        if job.status == "failed":
+            raise HTTPException(status_code=429, detail="the Colab GPU queue is full; retry after a task finishes")
+        return job_payload(job)
+
+    @app.get("/v2/jobs/{job_id}", dependencies=[Depends(require_token)])
+    def job_status(job_id: str) -> dict[str, object]:
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job was not found")
+        return job_payload(job)
+
+    @app.delete("/v2/jobs/{job_id}", dependencies=[Depends(require_token)])
+    def cancel_job(job_id: str) -> dict[str, object]:
+        try:
+            job = jobs.cancel(job_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="job was not found") from error
+        return job_payload(job)
+
+    @app.get("/v2/jobs/{job_id}/audio", dependencies=[Depends(require_token)])
+    def job_audio(job_id: str) -> FileResponse:
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job was not found")
+        if job.status != "succeeded" or not job.result_path or not Path(job.result_path).is_file():
+            raise HTTPException(status_code=409, detail="job audio is not ready")
+        return FileResponse(job.result_path, media_type="audio/wav", filename="kova-generated.wav")
 
     @app.get("/v1/pairing/{code}")
     def claim_desktop_pairing(code: str) -> dict[str, str]:
@@ -173,6 +415,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         consent_confirmed: bool = Form(False),
         ref_text: str = Form(""),
         language: str = Form("vi"),
+        separate_music: bool = Form(False),
         ref_audio: UploadFile = File(...),
     ) -> dict[str, object]:
         if not consent_confirmed:
@@ -186,12 +429,12 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         blob = await ref_audio.read(MAX_REFERENCE_BYTES + 1)
         if not blob or len(blob) > MAX_REFERENCE_BYTES:
             raise HTTPException(status_code=413, detail="reference audio is empty or exceeds the upload limit")
-        # The notebook's CUDA Demucs pass removes music before OmniVoice ever
-        # receives or stores a profile reference.  Refusing a failed split is
-        # intentional: silently cloning a mixed song would make the profile
-        # reproduce accompaniment in every later utterance.
+        # When the owner opts into the CUDA Demucs pass, refuse a failed split
+        # rather than silently cloning a music-contaminated reference.
         try:
-            clean_blob, clean_filename = vocal_only_reference(blob, safe_name, path.parent)
+            clean_blob, clean_filename = vocal_only_reference(
+                blob, safe_name, path.parent, separate_music=separate_music
+            )
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         duration_seconds = reference_duration_seconds(clean_blob)
@@ -240,11 +483,11 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
                         pass
                 raise HTTPException(status_code=503, detail=f"OmniVoice could not prepare the voice clone prompt: {type(error).__name__}") from error
         profile_payload = profile.__dict__ | {
-            "reference_clean": os.environ.get("KOVA_VOICE_SEPARATE_REFERENCE", "") == "1",
+            "reference_clean": separate_music,
             # An explicit marker lets the desktop make the safety property
             # visible: OmniVoice receives the vocal stem, never the uploaded
             # music mix. This is metadata only; no source audio is exposed.
-            "reference_processing": "demucs_cuda_vocals",
+            "reference_processing": "demucs_cuda_vocals" if separate_music else "none",
             "voice_clone_prompt_ready": prompt_ready,
         }
         return {"id": profile.id, "profile": profile_payload, "version": safe_version(version)}
@@ -409,14 +652,57 @@ def auto_transcribe_reference(blob: bytes, filename: str, language: str) -> str:
     return transcript
 
 
-def vocal_only_reference(blob: bytes, filename: str, work_root: Path) -> tuple[bytes, str]:
+def public_job_error(code: str) -> str:
+    return {
+        "queue_full": "the Colab GPU is busy; wait for a task to finish and retry",
+        "worker_restarted": "the Colab worker restarted before this task finished",
+        "validation_failed": "the audio or synthesis settings need attention",
+        "worker_failed": "the GPU worker could not complete this task",
+    }.get(code, "the worker could not complete this task")
+
+
+def transcription_available() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def stage_upload(upload: UploadFile, directory: Path) -> Path:
+    """Stage a multipart upload without reading its full body into RAM."""
+    safe_name = SAFE_FILENAME.sub("_", Path(upload.filename or "reference.wav").name).strip("._") or "reference.wav"
+    if Path(safe_name).suffix.lower() not in {".wav", ".mp3", ".flac"}:
+        raise HTTPException(status_code=422, detail="reference audio must be WAV, MP3, or FLAC")
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / (secrets.token_hex(16) + Path(safe_name).suffix.lower())
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := upload.file.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_REFERENCE_BYTES:
+                    raise HTTPException(status_code=413, detail="reference audio is empty or exceeds the upload limit")
+                output.write(chunk)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    if total == 0:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail="reference audio is empty or exceeds the upload limit")
+    return destination
+
+
+def vocal_only_reference(
+    blob: bytes, filename: str, work_root: Path, *, separate_music: bool = False
+) -> tuple[bytes, str]:
     """Return a clean voice stem when the CUDA notebook enabled separation.
 
-    The switch is deliberately opt-in at the worker level so developers can
-    run the lightweight API tests without downloading Demucs. KOVA's shipped
-    Colab notebook sets it to 1 and installs Demucs on its GPU runtime.
+    The switch is deliberately opt-in per profile so a clean spoken reference
+    is not unnecessarily altered. The shipped Colab notebook installs Demucs
+    for references that the desktop explicitly marks as containing music.
     """
-    if os.environ.get("KOVA_VOICE_SEPARATE_REFERENCE", "") != "1":
+    if not separate_music:
         return blob, filename
     suffix = Path(filename).suffix.lower() or ".wav"
     try:

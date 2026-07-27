@@ -41,4 +41,7 @@ func main() {
 	}); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "KOVA Voice Studio stopped:", err)
 	}
+	if app.debugLog != nil {
+		app.debugLog.Close()
+	}
 }

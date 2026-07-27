@@ -1,5 +1,6 @@
 # Private local state: cloned-voice profiles, reference audio metadata, and history
 /data/
+/worker/data/
 
 # Generated desktop packages and local build output
 /build/bin/

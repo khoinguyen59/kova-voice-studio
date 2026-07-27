@@ -224,6 +224,10 @@ func TestAutoTranscribeReferenceReturnsAnEditableDraft(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v2/jobs/transcription" {
+			http.NotFound(response, request)
+			return
+		}
 		if request.URL.Path != "/transcribe-reference" || request.Header.Get("Authorization") != "Bearer session-token" {
 			http.Error(response, "unexpected request", http.StatusBadRequest)
 			return
@@ -251,7 +255,7 @@ func TestAutoTranscribeReferenceReturnsAnEditableDraft(t *testing.T) {
 }
 
 func TestColabNotebookIsHostedWithTheDesktopProject(t *testing.T) {
-	if !strings.Contains(voiceStudioNotebookURL, "khoinguyen59/kova-voice-studio/blob/master/worker/notebooks/") {
+	if !strings.Contains(voiceStudioNotebookURL, "khoinguyen59/kova-voice-studio/blob/v"+applicationVersion+"/worker/notebooks/") {
 		t.Fatalf("notebook must be embedded in this repository: %s", voiceStudioNotebookURL)
 	}
 	if strings.Contains(voiceStudioNotebookURL, "kova-video-dubbing") {
@@ -326,12 +330,50 @@ func TestReadVoiceReferenceAudioUsesPrivateBackupWithoutWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dataURL, err := NewApp().ReadVoiceReferenceAudio("saved-profile")
+	dataURL, err := NewApp().ReadVoiceReferenceAudio(WorkerSession{}, "saved-profile")
 	if err != nil {
 		t.Fatalf("read local reference: %v", err)
 	}
 	if !strings.HasPrefix(dataURL, "data:audio/") || !strings.Contains(dataURL, ";base64,") {
 		t.Fatalf("expected browser-playable local audio URL, got %q", dataURL)
+	}
+}
+
+func TestReadVoiceReferenceAudioRecoversMissingBackupFromCurrentWorker(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("KOVA_VOICE_STUDIO_DATA_DIR", dataDir)
+	state := studioState{Version: 1, Theme: "light", Locale: "vi", Voices: []VoiceProfile{{
+		ID: "saved-profile", RemoteID: "worker-profile", Name: "Recovered sample", Language: "vi",
+	}}}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "studio-state.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/profiles/worker-profile/reference" || request.Header.Get("Authorization") != "Bearer session-token" {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Disposition", `attachment; filename="reference.wav"`)
+		response.Header().Set("Content-Type", "audio/wav")
+		_, _ = response.Write([]byte("RIFF-recovered-reference"))
+	}))
+	defer server.Close()
+	app := NewApp()
+	app.client = server.Client()
+	dataURL, err := app.ReadVoiceReferenceAudio(WorkerSession{BaseURL: server.URL, Token: "session-token"}, "saved-profile")
+	if err != nil {
+		t.Fatalf("recover missing local reference: %v", err)
+	}
+	if !strings.HasPrefix(dataURL, "data:audio/") {
+		t.Fatalf("expected browser-playable recovered audio URL, got %q", dataURL)
+	}
+	bootstrap, err := app.Bootstrap()
+	if err != nil || len(bootstrap.Voices) != 1 || !bootstrap.Voices[0].BackupAvailable || bootstrap.Voices[0].ReferenceFile == "" {
+		t.Fatalf("recovered reference was not persisted: voices=%#v err=%v", bootstrap.Voices, err)
 	}
 }
 

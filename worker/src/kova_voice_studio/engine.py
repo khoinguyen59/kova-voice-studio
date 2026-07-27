@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from io import BytesIO
 import os
-from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Any
 
 
 class OmniVoiceEngine:
     def __init__(self) -> None:
         self._model: Any | None = None
-        self._lock = Lock()
+        # The legacy synchronous endpoints may still be used by an older
+        # desktop client. Keep the model and prompt cache serial even outside
+        # the v2 job queue so two GPU calls can never race on one runtime.
+        self._lock = RLock()
         self._device = "unconfigured"
         self._dtype = "unconfigured"
         # Prompt tensors are process-local by design: they are derived only from
@@ -99,6 +101,10 @@ class OmniVoiceEngine:
         with self._lock:
             self._voice_clone_prompts.pop(profile_id, None)
 
+    def has_voice_clone_prompt(self, profile_id: str) -> bool:
+        with self._lock:
+            return profile_id in self._voice_clone_prompts
+
     def synthesize(
         self,
         *,
@@ -120,19 +126,19 @@ class OmniVoiceEngine:
             profile_id=profile_id, reference_audio=reference_audio,
             reference_text=reference_text, language=language,
         )
-        prompt = self._voice_clone_prompts[profile_id]
-        kwargs: dict[str, Any] = {
-            "text": text, "voice_clone_prompt": prompt, "language": language or None,
-            "speed": speed, "num_step": num_steps,
-        }
-        if duration is not None:
-            kwargs["duration"] = duration
-        # `instruct` is voice-design vocabulary, not a free-form emotion
-        # prompt. Clone emotion is represented by the documented non-verbal
-        # tokens placed in `text`; omitting a legacy instruct avoids a model
-        # ValueError for ordinary descriptions such as "natural" or "sad".
-        _ = instruct
-        audio = self._model.generate(**kwargs)
+        with self._lock:
+            prompt = self._voice_clone_prompts[profile_id]
+            kwargs: dict[str, Any] = {
+                "text": text, "voice_clone_prompt": prompt, "language": language or None,
+                "speed": speed, "num_step": num_steps,
+            }
+            if duration is not None:
+                kwargs["duration"] = duration
+            # `instruct` is voice-design vocabulary, not a free-form emotion
+            # prompt. Clone emotion is represented by documented non-verbal
+            # tokens placed in `text`; ordinary emotional prose is omitted.
+            _ = instruct
+            audio = self._model.generate(**kwargs)
         if not audio:
             raise RuntimeError("OmniVoice returned no audio")
         output = BytesIO()

@@ -20,6 +20,9 @@ token is kept in the browser page memory and is not stored by that UI.
   API response.
 - KOVA reuses an opaque saved profile ID for every generation. It does not
   upload a new reference clip per cue, preventing accidental voice drift.
+- Music/vocal separation is opt-in (`separate_music=true`). A clean spoken
+  reference should not be processed by Demucs; use it only for recordings with
+  music or heavy background sound.
 - Set `KOVA_VOICE_API_TOKEN` for a Colab worker. KOVA sends it only as a bearer
   header kept in runtime memory.
 
@@ -37,6 +40,13 @@ POST /transcribe-reference      optional editable transcript draft
 GET  /v1/voices?status=ready    KOVA dropdown source
 POST /generate                  multipart synthesis for profile:<id>
 GET  /v1/pairing/{one-time-code} one-click desktop pairing
+
+POST /v2/jobs/profile            queued multipart profile creation
+POST /v2/jobs/transcription      queued transcript draft
+POST /v2/jobs/generation         queued synthesis
+GET  /v2/jobs/{job_id}           durable job status/error
+DELETE /v2/jobs/{job_id}         request cancellation
+GET  /v2/jobs/{job_id}/audio     completed generation audio
 ```
 
 ## One-click Colab pairing
@@ -48,8 +58,9 @@ The desktop exchanges that code over HTTPS for the bearer token, verifies the
 GPU worker, and keeps the token only in the current app session. Manual URL
 and token inputs remain available as a fallback.
 
-`POST /generate` loads OmniVoice lazily. Health/profile routes never load a
-model or start inference. To run inference on Colab, use
+OmniVoice loads lazily on the first GPU job. A CUDA health response means the
+worker is ready to accept work even while `ready=false`; health/profile routes
+never load a model or start inference. To run inference on Colab, use
 [`notebooks/Kova_Voice_Studio_GPU.ipynb`](notebooks/Kova_Voice_Studio_GPU.ipynb),
 select a GPU runtime, run all cells, then paste its printed URL and token into
 KOVA Desktop's **Giọng lồng tiếng cố định / Fixed dubbing voice** stage.

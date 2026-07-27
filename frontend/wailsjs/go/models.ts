@@ -374,6 +374,7 @@ export namespace main {
 	    reference_path: string;
 	    reference_text: string;
 	    consent_confirmed: boolean;
+	    separate_music: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new VoiceCreateRequest(source);
@@ -388,11 +389,15 @@ export namespace main {
 	        this.reference_path = source["reference_path"];
 	        this.reference_text = source["reference_text"];
 	        this.consent_confirmed = source["consent_confirmed"];
+	        this.separate_music = source["separate_music"];
 	    }
 	}
 	
 	export class WorkerHealth {
 	    reachable: boolean;
+	    ready: boolean;
+	    busy: boolean;
+	    queue_depth: number;
 	    message: string;
 	    device?: string;
 	
@@ -403,6 +408,9 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.reachable = source["reachable"];
+	        this.ready = source["ready"];
+	        this.busy = source["busy"];
+	        this.queue_depth = source["queue_depth"];
 	        this.message = source["message"];
 	        this.device = source["device"];
 	    }

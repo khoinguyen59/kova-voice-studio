@@ -2,8 +2,10 @@ import {
   ApplyEmotionWithGateway as bridgeApplyEmotionWithGateway,
 	AutoTranscribeReference as bridgeAutoTranscribeReference,
   Bootstrap as bridgeBootstrap,
+	CancelWorkerJob as bridgeCancelWorkerJob,
   CheckWorker as bridgeCheckWorker,
   CreateVoice as bridgeCreateVoice,
+	DebugLogLocation as bridgeDebugLogLocation,
   DeleteHistory as bridgeDeleteHistory,
   DeleteVoice as bridgeDeleteVoice,
   GenerateVoice as bridgeGenerateVoice,
@@ -51,6 +53,7 @@ export type EmotionTextRequest = Plain<main.EmotionTextRequest>;
 export type ReferenceTranscriptRequest = Plain<main.ReferenceTranscriptRequest>;
 
 export type TaskProgress = {
+	job_id?: string;
   task: "clone" | "preview" | "generate";
   phase: string;
   percent: number;
@@ -94,6 +97,14 @@ export const openGoogleDrive = async () => {
 export const checkWorker = async (session: Session) => {
   desktop();
   return bridgeCheckWorker(session);
+};
+export const cancelWorkerJob = async (session: Session, jobID: string) => {
+  desktop();
+  return bridgeCancelWorkerJob(session, jobID);
+};
+export const debugLogLocation = async () => {
+  desktop();
+  return bridgeDebugLogLocation();
 };
 export const selectReferenceAudio = async () => {
   desktop();
@@ -143,9 +154,9 @@ export const previewVoice = async (request: GeneratePayload) => {
   desktop();
   return bridgePreviewVoice(request);
 };
-export const readVoiceReferenceAudio = async (voiceID: string) => {
+export const readVoiceReferenceAudio = async (session: Session, voiceID: string) => {
   desktop();
-  return bridgeReadVoiceReferenceAudio(voiceID);
+  return bridgeReadVoiceReferenceAudio(session, voiceID);
 };
 export const readReferenceAudioSource = async (path: string) => {
   desktop();

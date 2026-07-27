@@ -1,4 +1,6 @@
 from io import BytesIO
+from threading import Event
+import time
 import wave
 
 from fastapi.testclient import TestClient
@@ -125,3 +127,81 @@ def test_generation_ignores_legacy_freeform_instruct_and_reports_reference_valid
     rejected = client.post("/generate", data={"text": "Noi dung moi.", "profile_id": profile_id})
     assert rejected.status_code == 422
     assert "reference clip becomes silent" in rejected.json()["detail"]
+
+
+def wait_for_job(client: TestClient, job_id: str) -> dict[str, object]:
+    for _ in range(80):
+        job = client.get(f"/v2/jobs/{job_id}")
+        assert job.status_code == 200
+        payload = job.json()
+        if payload["status"] in {"succeeded", "failed", "cancelled"}:
+            return payload
+        time.sleep(0.02)
+    raise AssertionError("job did not finish")
+
+
+def test_v2_jobs_queue_profile_transcription_and_audio(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "kova_voice_studio.api.auto_transcribe_reference",
+        lambda blob, filename, language: "Transcript draft.",
+    )
+    client = TestClient(create_app(tmp_path / "voice.db"))
+
+    transcript_job = client.post(
+        "/v2/jobs/transcription",
+        data={"language": "vi"},
+        files={"ref_audio": ("voice.wav", reference_wav(), "audio/wav")},
+    )
+    assert transcript_job.status_code == 202
+    transcript = wait_for_job(client, transcript_job.json()["id"])
+    assert transcript["status"] == "succeeded"
+    assert transcript["result"] == {"text": "Transcript draft."}
+
+    profile_job = client.post(
+        "/v2/jobs/profile",
+        data={"name": "Voice", "consent_confirmed": "true", "language": "vi", "ref_text": "Exact words."},
+        files={"ref_audio": ("voice.wav", reference_wav(), "audio/wav")},
+    )
+    assert profile_job.status_code == 202
+    profile = wait_for_job(client, profile_job.json()["id"])
+    assert profile["status"] == "succeeded"
+    profile_id = profile["result"]["id"]
+
+    monkeypatch.setattr(api_module.engine, "synthesize", lambda **kwargs: reference_wav())
+    generation_job = client.post(
+        "/v2/jobs/generation",
+        json={"text": "New content.", "profile_id": profile_id, "language": "vi", "speed": 1.0, "num_step": 32},
+    )
+    assert generation_job.status_code == 202
+    generated = wait_for_job(client, generation_job.json()["id"])
+    assert generated["status"] == "succeeded"
+    audio = client.get(f"/v2/jobs/{generation_job.json()['id']}/audio")
+    assert audio.status_code == 200
+    assert audio.content == reference_wav()
+
+
+def test_cancelling_a_profile_during_prompt_preparation_removes_it(monkeypatch, tmp_path):
+    entered = Event()
+    release = Event()
+
+    def prepare_prompt(**kwargs):
+        entered.set()
+        assert release.wait(timeout=3)
+
+    monkeypatch.setenv("KOVA_VOICE_PREPARE_PROFILE_PROMPT", "1")
+    monkeypatch.setattr(api_module.engine, "prepare_voice_clone_prompt", prepare_prompt)
+    client = TestClient(create_app(tmp_path / "voice.db"))
+    submitted = client.post(
+        "/v2/jobs/profile",
+        data={"name": "Voice", "consent_confirmed": "true", "language": "vi", "ref_text": "Exact words."},
+        files={"ref_audio": ("voice.wav", reference_wav(), "audio/wav")},
+    )
+    assert submitted.status_code == 202
+    job_id = submitted.json()["id"]
+    assert entered.wait(timeout=3)
+    cancelled = client.delete(f"/v2/jobs/{job_id}")
+    assert cancelled.status_code == 200
+    release.set()
+    job = wait_for_job(client, job_id)
+    assert job["status"] == "cancelled"
+    assert client.get("/v1/voices?status=ready").json() == []

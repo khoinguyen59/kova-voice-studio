@@ -41,6 +41,23 @@ class ProfileVersion:
     created_at: str
 
 
+@dataclass(frozen=True)
+class WorkerJob:
+    id: str
+    kind: str
+    status: str
+    stage: str
+    percent: int
+    message: str
+    error_code: str
+    error_detail: str
+    result_json: str
+    result_path: str
+    cancel_requested: bool
+    created_at: str
+    updated_at: str
+
+
 class ProfileStore:
     def __init__(self, database_path: str | Path) -> None:
         self._path = Path(database_path)
@@ -80,6 +97,22 @@ class ProfileStore:
               created_at TEXT NOT NULL,
               UNIQUE(profile_id, version)
             );
+            CREATE TABLE IF NOT EXISTS worker_jobs (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              status TEXT NOT NULL,
+              stage TEXT NOT NULL,
+              percent INTEGER NOT NULL,
+              message TEXT NOT NULL DEFAULT '',
+              error_code TEXT NOT NULL DEFAULT '',
+              error_detail TEXT NOT NULL DEFAULT '',
+              result_json TEXT NOT NULL DEFAULT '',
+              result_path TEXT NOT NULL DEFAULT '',
+              cancel_requested INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_worker_jobs_updated_at ON worker_jobs(updated_at DESC);
             """
         )
         self._connection.commit()
@@ -96,6 +129,21 @@ class ProfileStore:
         if "reference_text" not in columns:
             self._connection.execute("ALTER TABLE profile_versions ADD COLUMN reference_text TEXT NOT NULL DEFAULT ''")
             self._connection.commit()
+
+        # Jobs cannot safely resume after a Colab restart because model memory
+        # and temporary files are process-local. Preserve their record, but
+        # make the interruption explicit instead of leaving a task "running".
+        now = utc_now()
+        self._connection.execute(
+            """UPDATE worker_jobs
+               SET status = 'failed', stage = 'interrupted', percent = 100,
+                   error_code = 'worker_restarted',
+                   error_detail = 'worker restarted while the job was active',
+                   updated_at = ?
+               WHERE status IN ('queued', 'running')""",
+            (now,),
+        )
+        self._connection.commit()
 
     def create_profile(
         self,
@@ -165,6 +213,90 @@ class ProfileStore:
                 "UPDATE profile_versions SET reference_path = ? WHERE id = ?",
                 (reference_path, version_id),
             )
+
+    def create_job(self, job_id: str, kind: str, message: str = "") -> WorkerJob:
+        now = utc_now()
+        job = WorkerJob(job_id, kind, "queued", "queued", 0, message, "", "", "", "", False, now, now)
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO worker_jobs(id, kind, status, stage, percent, message, error_code,
+                   error_detail, result_json, result_path, cancel_requested, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job.id, job.kind, job.status, job.stage, job.percent, job.message,
+                    job.error_code, job.error_detail, job.result_json, job.result_path,
+                    int(job.cancel_requested), job.created_at, job.updated_at,
+                ),
+            )
+        return job
+
+    def update_job(
+        self,
+        job_id: str,
+        *,
+        status: str | None = None,
+        stage: str | None = None,
+        percent: int | None = None,
+        message: str | None = None,
+        error_code: str | None = None,
+        error_detail: str | None = None,
+        result_json: str | None = None,
+        result_path: str | None = None,
+    ) -> WorkerJob:
+        current = self.get_job(job_id)
+        if current is None:
+            raise KeyError(job_id)
+        values = {
+            "status": current.status if status is None else status,
+            "stage": current.stage if stage is None else stage,
+            "percent": current.percent if percent is None else max(0, min(100, int(percent))),
+            "message": current.message if message is None else message,
+            "error_code": current.error_code if error_code is None else error_code,
+            "error_detail": current.error_detail if error_detail is None else error_detail,
+            "result_json": current.result_json if result_json is None else result_json,
+            "result_path": current.result_path if result_path is None else result_path,
+            "updated_at": utc_now(),
+        }
+        with self._lock, self._connection:
+            self._connection.execute(
+                """UPDATE worker_jobs SET status = ?, stage = ?, percent = ?, message = ?,
+                   error_code = ?, error_detail = ?, result_json = ?, result_path = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    values["status"], values["stage"], values["percent"], values["message"],
+                    values["error_code"], values["error_detail"], values["result_json"],
+                    values["result_path"], values["updated_at"], job_id,
+                ),
+            )
+        updated = self.get_job(job_id)
+        assert updated is not None
+        return updated
+
+    def request_job_cancel(self, job_id: str) -> WorkerJob:
+        with self._lock, self._connection:
+            changed = self._connection.execute(
+                "UPDATE worker_jobs SET cancel_requested = 1, updated_at = ? WHERE id = ?",
+                (utc_now(), job_id),
+            ).rowcount
+        if not changed:
+            raise KeyError(job_id)
+        job = self.get_job(job_id)
+        assert job is not None
+        return job
+
+    def get_job(self, job_id: str) -> WorkerJob | None:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT id, kind, status, stage, percent, message, error_code, error_detail,
+                   result_json, result_path, cancel_requested, created_at, updated_at
+                   FROM worker_jobs WHERE id = ?""",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["cancel_requested"] = bool(values["cancel_requested"])
+        return WorkerJob(**values)
 
     def list_profiles(self) -> list[Profile]:
         with self._lock:

@@ -3,7 +3,7 @@
   "name": "KOVA Voice Studio",
   "outputfilename": "KOVA-Voice-Studio",
   "frontend:dir": "frontend",
-  "frontend:install": "npm install",
+  "frontend:install": "npm ci",
   "frontend:build": "npm run build",
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
@@ -14,7 +14,7 @@
   "info": {
     "companyName": "KOVA",
     "productName": "KOVA Voice Studio",
-    "productVersion": "1.0.2.0",
+    "productVersion": "1.0.2.1",
     "copyright": "Copyright (c) 2026 KOVA",
     "comments": "Private desktop client for a user-controlled KOVA Voice Studio worker."
   }

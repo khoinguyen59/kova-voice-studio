@@ -10,11 +10,15 @@ export function Bootstrap():Promise<main.StudioBootstrap>;
 
 export function CheckWorker(arg1:main.WorkerSession):Promise<main.WorkerHealth>;
 
+export function CancelWorkerJob(arg1:main.WorkerSession,arg2:string):Promise<void>;
+
 export function CreateVoice(arg1:main.VoiceCreateRequest):Promise<main.VoiceProfile>;
 
 export function DeleteHistory(arg1:string):Promise<Array<main.GenerationHistory>>;
 
 export function DeleteVoice(arg1:main.WorkerSession,arg2:string):Promise<Array<main.VoiceProfile>>;
+
+export function DebugLogLocation():Promise<string>;
 
 export function GenerateVoice(arg1:main.GenerateRequest):Promise<main.GenerationResult>;
 
@@ -34,7 +38,7 @@ export function PreviewVoice(arg1:main.GenerateRequest):Promise<main.GenerationR
 
 export function ReadReferenceAudioSource(arg1:string):Promise<string>;
 
-export function ReadVoiceReferenceAudio(arg1:string):Promise<string>;
+export function ReadVoiceReferenceAudio(arg1:main.WorkerSession,arg2:string):Promise<string>;
 
 export function RefreshVoiceLibrary(arg1:main.WorkerSession):Promise<Array<main.VoiceProfile>>;
 

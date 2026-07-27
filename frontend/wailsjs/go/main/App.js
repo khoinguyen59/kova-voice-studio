@@ -18,6 +18,10 @@ export function CheckWorker(arg1) {
   return window['go']['main']['App']['CheckWorker'](arg1);
 }
 
+export function CancelWorkerJob(arg1, arg2) {
+  return window['go']['main']['App']['CancelWorkerJob'](arg1, arg2);
+}
+
 export function CreateVoice(arg1) {
   return window['go']['main']['App']['CreateVoice'](arg1);
 }
@@ -28,6 +32,10 @@ export function DeleteHistory(arg1) {
 
 export function DeleteVoice(arg1, arg2) {
   return window['go']['main']['App']['DeleteVoice'](arg1, arg2);
+}
+
+export function DebugLogLocation() {
+  return window['go']['main']['App']['DebugLogLocation']();
 }
 
 export function GenerateVoice(arg1) {
@@ -66,8 +74,8 @@ export function ReadReferenceAudioSource(arg1) {
   return window['go']['main']['App']['ReadReferenceAudioSource'](arg1);
 }
 
-export function ReadVoiceReferenceAudio(arg1) {
-  return window['go']['main']['App']['ReadVoiceReferenceAudio'](arg1);
+export function ReadVoiceReferenceAudio(arg1, arg2) {
+  return window['go']['main']['App']['ReadVoiceReferenceAudio'](arg1, arg2);
 }
 
 export function RefreshVoiceLibrary(arg1) {
