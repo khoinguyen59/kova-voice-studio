@@ -4,7 +4,7 @@ KOVA Voice Studio is a self-contained Windows project for creating and reusing c
 
 ## Run the packaged app
 
-The production executable is written directly to `build/KOVA-Voice-Studio-<version>.exe`; for this release it is `build/KOVA-Voice-Studio-1.0.1.9.exe`. On Windows, open it directly; WebView2 is required (it is normally included with current Windows installations).
+The production executable is written directly to `build/KOVA-Voice-Studio-<version>.exe`; for this release it is `build/KOVA-Voice-Studio-1.0.2.0.exe`. On Windows, open it directly; WebView2 is required (it is normally included with current Windows installations).
 
 ## First connection
 

@@ -77,13 +77,22 @@ class OmniVoiceEngine:
             if profile_id in self._voice_clone_prompts:
                 return
             try:
+                # The official reusable-prompt API takes only the reference
+                # audio/text. Language conditioning belongs to generate(), not
+                # create_voice_clone_prompt().
                 prompt = self._model.create_voice_clone_prompt(
-                    ref_audio=reference_audio, ref_text=reference_text, language=language or None
+                    ref_audio=reference_audio, ref_text=reference_text
                 )
-            except TypeError:
-                # OmniVoice releases before language conditioning accepted the same
-                # prompt builder but without `language`.
-                prompt = self._model.create_voice_clone_prompt(ref_audio=reference_audio, ref_text=reference_text)
+            except ValueError as error:
+                # OmniVoice's default silence removal can reject a quiet but
+                # valid short clip. Its documented recovery is to keep the
+                # selected waveform intact for conditioning.
+                if "empty after silence removal" not in str(error).lower():
+                    raise
+                prompt = self._model.create_voice_clone_prompt(
+                    ref_audio=reference_audio, ref_text=reference_text,
+                    preprocess_prompt=False,
+                )
             self._voice_clone_prompts[profile_id] = prompt
 
     def drop_voice_clone_prompt(self, profile_id: str) -> None:
@@ -114,17 +123,16 @@ class OmniVoiceEngine:
         prompt = self._voice_clone_prompts[profile_id]
         kwargs: dict[str, Any] = {
             "text": text, "voice_clone_prompt": prompt, "language": language or None,
-            "speed": speed, "duration": duration, "num_step": num_steps,
+            "speed": speed, "num_step": num_steps,
         }
-        if instruct.strip():
-            kwargs["instruct"] = instruct.strip()
-        try:
-            audio = self._model.generate(**kwargs)
-        except TypeError as error:
-            # A clear error is safer than silently discarding a requested style.
-            if instruct.strip() and "instruct" in str(error):
-                raise RuntimeError("this OmniVoice version does not support vocal-style instructions; update the Colab OmniVoice package") from error
-            raise
+        if duration is not None:
+            kwargs["duration"] = duration
+        # `instruct` is voice-design vocabulary, not a free-form emotion
+        # prompt. Clone emotion is represented by the documented non-verbal
+        # tokens placed in `text`; omitting a legacy instruct avoids a model
+        # ValueError for ordinary descriptions such as "natural" or "sad".
+        _ = instruct
+        audio = self._model.generate(**kwargs)
         if not audio:
             raise RuntimeError("OmniVoice returned no audio")
         output = BytesIO()

@@ -189,9 +189,10 @@ type VoiceProfile struct {
 	ReferenceText string `json:"reference_text,omitempty"`
 }
 
-// EmotionPreset contains only OmniVoice's documented non-verbal tokens. The
-// human-readable instructions are sent as `instruct`; the optional tokens are
-// offered to the AI editor as an allow-list, never free-form bracket syntax.
+// EmotionPreset contains only OmniVoice's documented non-verbal tokens. Its
+// human-readable instruction is for the AI editor only: cloned voices must
+// never receive it as OmniVoice `instruct`, whose vocabulary is intentionally
+// much narrower than emotional language.
 type EmotionPreset struct {
 	ID       string   `json:"id"`
 	LabelVI  string   `json:"label_vi"`
@@ -366,18 +367,18 @@ func (a *App) Bootstrap() (StudioBootstrap, error) {
 
 func emotionPresets() []EmotionPreset {
 	return []EmotionPreset{
-		{ID: "neutral", LabelVI: "Tự nhiên", LabelEN: "Natural", Instruct: "natural, clear, conversational, neutral emotion", Tokens: []string{}},
-		{ID: "cheerful", LabelVI: "Vui vẻ", LabelEN: "Cheerful", Instruct: "warm, cheerful, smiling, conversational, medium energy", Tokens: []string{"[laughter]"}},
-		{ID: "playful", LabelVI: "Hài hước", LabelEN: "Playful", Instruct: "playful, witty, smiling, light-hearted, conversational", Tokens: []string{"[laughter]"}},
-		{ID: "energetic", LabelVI: "Sôi nổi", LabelEN: "Energetic", Instruct: "energetic, lively, upbeat, confident, clear", Tokens: []string{}},
-		{ID: "calm", LabelVI: "Bình tĩnh", LabelEN: "Calm", Instruct: "calm, gentle, measured, warm, relaxed", Tokens: []string{}},
-		{ID: "sad", LabelVI: "Buồn bã", LabelEN: "Sad", Instruct: "gentle, subdued, reflective, emotionally restrained, slightly slower", Tokens: []string{"[sigh]"}},
-		{ID: "tender", LabelVI: "Dịu dàng", LabelEN: "Tender", Instruct: "soft, warm, tender, intimate, careful pacing", Tokens: []string{}},
-		{ID: "serious", LabelVI: "Nghiêm túc", LabelEN: "Serious", Instruct: "serious, composed, professional, clear, steady", Tokens: []string{}},
-		{ID: "surprised", LabelVI: "Ngạc nhiên", LabelEN: "Surprised", Instruct: "bright, surprised, animated, natural", Tokens: []string{"[surprise-ah]", "[surprise-oh]", "[surprise-wa]", "[surprise-yo]"}},
-		{ID: "questioning", LabelVI: "Thắc mắc", LabelEN: "Questioning", Instruct: "curious, questioning, natural rising intonation", Tokens: []string{"[question-en]", "[question-ah]", "[question-oh]", "[question-ei]", "[question-yi]"}},
-		{ID: "dissatisfied", LabelVI: "Không hài lòng", LabelEN: "Dissatisfied", Instruct: "restrained dissatisfaction, firm but controlled", Tokens: []string{"[dissatisfaction-hnn]"}},
-		{ID: "confirming", LabelVI: "Khẳng định", LabelEN: "Confirming", Instruct: "affirming, confident, concise, natural", Tokens: []string{"[confirmation-en]"}},
+		{ID: "neutral", LabelVI: "Tự nhiên", LabelEN: "Natural", Instruct: "natural, clear conversational delivery", Tokens: []string{}},
+		{ID: "cheerful", LabelVI: "Vui vẻ", LabelEN: "Cheerful", Instruct: "warm and cheerful delivery; use a laugh only where it is natural", Tokens: []string{"[laughter]"}},
+		{ID: "playful", LabelVI: "Hài hước", LabelEN: "Playful", Instruct: "playful, light-hearted delivery; use a laugh only where it helps the meaning", Tokens: []string{"[laughter]"}},
+		{ID: "energetic", LabelVI: "Sôi nổi", LabelEN: "Energetic", Instruct: "energetic, lively spoken delivery", Tokens: []string{}},
+		{ID: "calm", LabelVI: "Bình tĩnh", LabelEN: "Calm", Instruct: "calm, measured spoken delivery", Tokens: []string{}},
+		{ID: "sad", LabelVI: "Buồn bã", LabelEN: "Sad", Instruct: "subdued, reflective delivery; use a sigh only where it is natural", Tokens: []string{"[sigh]"}},
+		{ID: "tender", LabelVI: "Dịu dàng", LabelEN: "Tender", Instruct: "soft, gentle spoken delivery", Tokens: []string{}},
+		{ID: "serious", LabelVI: "Nghiêm túc", LabelEN: "Serious", Instruct: "serious, composed spoken delivery", Tokens: []string{}},
+		{ID: "surprised", LabelVI: "Ngạc nhiên", LabelEN: "Surprised", Instruct: "surprised delivery; place at most one natural surprise token per sentence", Tokens: []string{"[surprise-ah]", "[surprise-oh]", "[surprise-wa]", "[surprise-yo]"}},
+		{ID: "questioning", LabelVI: "Thắc mắc", LabelEN: "Questioning", Instruct: "questioning delivery; place a question token only at a natural question", Tokens: []string{"[question-en]", "[question-ah]", "[question-oh]", "[question-ei]", "[question-yi]"}},
+		{ID: "dissatisfied", LabelVI: "Không hài lòng", LabelEN: "Dissatisfied", Instruct: "restrained dissatisfaction; use the token only where it is natural", Tokens: []string{"[dissatisfaction-hnn]"}},
+		{ID: "confirming", LabelVI: "Khẳng định", LabelEN: "Confirming", Instruct: "confident confirmation; use the token only where it is natural", Tokens: []string{"[confirmation-en]"}},
 	}
 }
 

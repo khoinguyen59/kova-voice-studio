@@ -3,6 +3,7 @@ import wave
 
 from fastapi.testclient import TestClient
 
+import kova_voice_studio.api as api_module
 from kova_voice_studio.api import create_app
 
 
@@ -92,3 +93,35 @@ def test_independent_voice_studio_ui_is_served_without_loading_a_model(tmp_path)
     page = client.get("/")
     assert page.status_code == 200
     assert "KOVA Voice Studio" in page.text
+
+
+def test_generation_ignores_legacy_freeform_instruct_and_reports_reference_validation(monkeypatch, tmp_path):
+    client = TestClient(create_app(tmp_path / "voice.db"))
+    created = client.post(
+        "/profiles",
+        data={"name": "Voice", "consent_confirmed": "true", "language": "vi", "ref_text": "Day la giong mau."},
+        files={"ref_audio": ("voice.wav", reference_wav(), "audio/wav")},
+    )
+    assert created.status_code == 201
+    profile_id = created.json()["id"]
+    calls: list[dict[str, object]] = []
+
+    def synthesize(**kwargs):
+        calls.append(kwargs)
+        return reference_wav()
+
+    monkeypatch.setattr(api_module.engine, "synthesize", synthesize)
+    generated = client.post(
+        "/generate",
+        data={"text": "Noi dung moi.", "profile_id": profile_id, "instruct": "natural, clear, conversational", "language": "vi"},
+    )
+    assert generated.status_code == 200
+    assert calls and calls[0]["instruct"] == "natural, clear, conversational"
+
+    def reject_reference(**kwargs):
+        raise ValueError("Reference audio is empty after silence removal. Try setting preprocess_prompt=False.")
+
+    monkeypatch.setattr(api_module.engine, "synthesize", reject_reference)
+    rejected = client.post("/generate", data={"text": "Noi dung moi.", "profile_id": profile_id})
+    assert rejected.status_code == 422
+    assert "reference clip becomes silent" in rejected.json()["detail"]

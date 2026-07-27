@@ -309,6 +309,11 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
                 profile_id=profile_id, language=language, instruct=instruct,
                 speed=speed, duration=duration, num_steps=num_step,
             )
+        except ValueError as error:
+            detail = str(error).strip()
+            if "empty after silence removal" in detail.lower():
+                detail = "the reference clip becomes silent after preprocessing; select a spoken 3–10 second region and try again"
+            raise HTTPException(status_code=422, detail=f"OmniVoice rejected the reference or script: {detail[:500]}") from error
         except Exception as error:
             raise HTTPException(status_code=503, detail=f"OmniVoice generation failed: {type(error).__name__}") from error
         return Response(content=audio, media_type="audio/wav", headers={"Cache-Control": "no-store"})
@@ -338,7 +343,20 @@ def reference_duration_seconds(blob: bytes) -> float:
     """
     try:
         import soundfile as sound_file
+    except ImportError:
+        # A WAV-only standard-library fallback keeps the upload API usable
+        # while a minimal local worker is being diagnosed. Colab installs
+        # soundfile and continues to validate MP3/FLAC through it.
+        try:
+            import wave
 
+            with wave.open(BytesIO(blob)) as audio:
+                if audio.getframerate() <= 0 or audio.getnframes() <= 0:
+                    raise ValueError("reference audio has no samples")
+                return float(audio.getnframes()) / float(audio.getframerate())
+        except Exception as error:
+            raise HTTPException(status_code=422, detail="reference audio cannot be decoded") from error
+    try:
         with sound_file.SoundFile(BytesIO(blob)) as audio:
             if audio.samplerate <= 0 or audio.frames <= 0:
                 raise ValueError("reference audio has no samples")

@@ -543,7 +543,7 @@ export default function App() {
         language: selected.language,
         speed,
         steps,
-		style_prompt: selectedEmotion?.instruct ?? "",
+		style_prompt: "",
       });
       setOutput(result);
       setNotice({
@@ -574,7 +574,7 @@ export default function App() {
         language: scriptLanguage,
         speed,
         steps,
-		style_prompt: selectedEmotion?.instruct ?? "",
+		style_prompt: "",
       });
       setOutput(result);
       setData((current) => ({
@@ -1596,7 +1596,7 @@ function StudioPage(props: {
           {review && <div className="review-result"><strong>{text(locale, "Bản AI đề xuất", "AI suggestion")}</strong><p>{review.review_summary || text(locale, "AI đã chuẩn hóa nội dung để bạn kiểm tra.", "AI normalized the content for your review.")}</p>{review.warnings.length > 0 && <ul>{review.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul>}<textarea readOnly value={review.revised_text} aria-label={text(locale, "Bản AI đề xuất", "AI suggestion")} /><div className="button-row"><button type="button" className="primary compact" onClick={props.onApplyReview}>{text(locale, "Áp dụng bản AI", "Apply AI version")}</button><button type="button" className="secondary compact" onClick={props.onDismissReview}>{text(locale, "Giữ bản hiện tại", "Keep current version")}</button></div></div>}
         </section>
 		<section className="emotion-control" aria-label="OmniVoice vocal style">
-		  <div><strong>{text(locale, "Tông giọng", "Vocal style")}</strong><p>{text(locale, "Chỉ dẫn phong cách được gửi tới OmniVoice. Thẻ trong danh sách là những cú pháp được phép duy nhất.", "The style instruction is sent to OmniVoice. The displayed tokens are the only allowed non-verbal syntax.")}</p></div>
+		  <div><strong>{text(locale, "Cảm xúc trong nội dung", "Emotion in the script")}</strong><p>{text(locale, "OmniVoice clone không nhận prompt cảm xúc tự do. Chọn phong cách rồi dùng AI Gateway chèn thẻ hợp lệ vào bản văn; nút tạo audio không gửi các cụm prompt không hợp lệ tới worker.", "OmniVoice cloning does not accept free-form emotion prompts. Select a style and use AI Gateway to place valid tags in the script; generation never sends unsupported prompt phrases to the worker.")}</p></div>
 		  <div className="emotion-fields">
 			<select value={emotionID} onChange={(event) => setEmotionID(event.target.value)}>{emotionPresets.map((preset) => <option value={preset.id} key={preset.id}>{locale === "vi" ? preset.label_vi : preset.label_en}</option>)}</select>
 			<button className="secondary compact" type="button" disabled={!script.trim() || busy !== ""} onClick={props.onApplyEmotion}>{busy === "emotion" ? text(locale, "Đang chuẩn bị…", "Preparing…") : text(locale, "Dùng AI chèn cảm xúc", "Use AI for emotion")}</button>
@@ -1724,11 +1724,16 @@ function ReferenceTrimmer(props: {
   onCropChange(value: string | null): void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const previewRef = useRef<HTMLAudioElement>(null);
   const audioBufferRef = useRef<AudioBuffer | null>(null);
-  const dragRef = useRef<"start" | "end" | "move" | null>(null);
+  const dragRef = useRef<{ pointerID: number; mode: "start" | "end" | "move"; startX: number; initialStart: number; initialEnd: number } | null>(null);
   const [duration, setDuration] = useState(0);
   const [start, setStart] = useState(0);
   const [end, setEnd] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playhead, setPlayhead] = useState(0);
   const [decodeError, setDecodeError] = useState("");
 
   useEffect(() => {
@@ -1784,45 +1789,124 @@ function ReferenceTrimmer(props: {
       context.lineTo(x + 0.5, height / 2 + amplitude);
     }
     context.stroke();
-  }, [duration, start, end]);
+  }, [duration, props.source]);
 
   useEffect(() => {
     const buffer = audioBufferRef.current;
-    if (!buffer || !duration || end <= start) return;
+    if (!buffer || !duration || end <= start || isDragging) return;
     if (start < 0.02 && end >= duration - 0.02) {
       props.onCropChange(null);
       return;
     }
     props.onCropChange(encodeWAVCrop(buffer, start, end));
-  }, [duration, start, end, props.onCropChange]);
+  }, [duration, start, end, isDragging, props.onCropChange]);
 
-  const setAtPointer = (event: any, mode: "start" | "end" | "move") => {
-    if (!duration) return;
-    const rect = (event.currentTarget as HTMLDivElement).getBoundingClientRect();
-    const second = Math.max(0, Math.min(duration, ((event.clientX - rect.left) / rect.width) * duration));
-    const minimum = Math.min(3, duration);
-    if (mode === "start") setStart(Math.min(second, end - minimum));
-    if (mode === "end") setEnd(Math.max(second, start + minimum));
-    if (mode === "move") {
-      const width = end - start;
-      const nextStart = Math.max(0, Math.min(second - width / 2, duration - width));
-      setStart(nextStart);
-      setEnd(nextStart + width);
+  const minimum = Math.min(3, duration);
+  const updateStart = (value: number) => {
+    if (!Number.isFinite(value)) return;
+    setStart(Math.max(0, Math.min(value, end - minimum)));
+  };
+  const updateEnd = (value: number) => {
+    if (!Number.isFinite(value)) return;
+    setEnd(Math.min(duration, Math.max(value, start + minimum)));
+  };
+  const beginDrag = (event: React.PointerEvent<HTMLElement>, mode: "start" | "end" | "move") => {
+    const track = trackRef.current;
+    if (!track || !duration) return;
+    event.preventDefault();
+    event.stopPropagation();
+    track.setPointerCapture(event.pointerId);
+    dragRef.current = { pointerID: event.pointerId, mode, startX: event.clientX, initialStart: start, initialEnd: end };
+    setIsDragging(true);
+  };
+  const moveDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    const track = trackRef.current;
+    if (!drag || !track || drag.pointerID !== event.pointerId) return;
+    const rect = track.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const delta = ((event.clientX - drag.startX) / rect.width) * duration;
+    const min = Math.min(3, duration);
+    if (drag.mode === "start") {
+      setStart(Math.max(0, Math.min(drag.initialStart + delta, drag.initialEnd - min)));
+      return;
     }
+    if (drag.mode === "end") {
+      setEnd(Math.min(duration, Math.max(drag.initialEnd + delta, drag.initialStart + min)));
+      return;
+    }
+    const width = drag.initialEnd - drag.initialStart;
+    const nextStart = Math.max(0, Math.min(drag.initialStart + delta, duration - width));
+    setStart(nextStart);
+    setEnd(nextStart + width);
+  };
+  const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current || dragRef.current.pointerID !== event.pointerId) return;
+    const track = trackRef.current;
+    if (track?.hasPointerCapture(event.pointerId)) track.releasePointerCapture(event.pointerId);
+    dragRef.current = null;
+    setIsDragging(false);
+  };
+  const stopPreview = () => {
+    const preview = previewRef.current;
+    if (!preview) return;
+    preview.pause();
+    preview.currentTime = start;
+    setPlayhead(start);
+    setIsPlaying(false);
+  };
+  const togglePreview = async () => {
+    const preview = previewRef.current;
+    if (!preview) return;
+    if (isPlaying) {
+      stopPreview();
+      return;
+    }
+    preview.pause();
+    preview.currentTime = start;
+    setPlayhead(start);
+    try {
+      await preview.play();
+      setIsPlaying(true);
+    } catch {
+      setDecodeError(text(props.locale, "Không thể phát audio mẫu trong ứng dụng này.", "The reference audio could not be played in this app."));
+    }
+  };
+  const updatePreview = () => {
+    const preview = previewRef.current;
+    if (!preview) return;
+    if (isPlaying && preview.currentTime >= end) {
+      preview.pause();
+      preview.currentTime = start;
+      setPlayhead(start);
+      setIsPlaying(false);
+      return;
+    }
+    setPlayhead(preview.currentTime);
   };
 
   if (decodeError) return <p className="helper trim-error">{decodeError}</p>;
   if (!duration) return <p className="helper">{text(props.locale, "Đang đọc sóng âm thanh…", "Reading waveform…")}</p>;
   const left = `${(start / duration) * 100}%`;
   const width = `${((end - start) / duration) * 100}%`;
+  const playheadLeft = `${(Math.max(start, Math.min(end, playhead)) / duration) * 100}%`;
   return <section className="reference-trimmer">
     <div className="trim-heading"><strong>{text(props.locale, "Cắt đoạn mẫu để clone", "Trim sample for cloning")}</strong><span>{start.toFixed(2)}s – {end.toFixed(2)}s · {(end - start).toFixed(2)}s</span></div>
-    <p>{text(props.locale, "Kéo hai mép khung. Chỉ đoạn nằm trong khung được gửi để clone; nên chọn một người nói, cùng ngôn ngữ, dài 3–10 giây.", "Drag the two frame edges. Only the selected segment is cloned; use one speaker, one language, for 3–10 seconds.")}</p>
-    <div className="waveform-track" onPointerMove={(event) => dragRef.current && setAtPointer(event, dragRef.current)} onPointerUp={() => { dragRef.current = null; }} onPointerLeave={() => { dragRef.current = null; }}>
+    <p>{text(props.locale, "Nghe toàn bộ file hoặc bấm nghe đoạn chọn. Kéo hai mép/khung thật chậm và chính xác, hoặc nhập thời gian theo giây.", "Listen to the full file or play the selected clip. Drag either edge/the frame precisely, or enter times in seconds.")}</p>
+    <audio className="reference-preview" ref={previewRef} src={props.source} controls preload="metadata" onTimeUpdate={updatePreview} onPause={() => setIsPlaying(false)} onEnded={() => { setIsPlaying(false); setPlayhead(start); }} />
+    <div className="trim-tools">
+      <button type="button" className="secondary compact" onClick={() => void togglePreview()}>{isPlaying ? text(props.locale, "Dừng nghe đoạn", "Stop selection") : text(props.locale, "▷ Nghe đoạn chọn", "▷ Play selection")}</button>
+      <div className="trim-time-grid">
+        <label>{text(props.locale, "Bắt đầu (giây)", "Start (seconds)")}<input aria-label={text(props.locale, "Bắt đầu", "Start")} type="number" min="0" max={Math.max(0, end - minimum)} step="0.01" value={Number(start.toFixed(2))} onChange={(event) => updateStart(Number(event.target.value))} /></label>
+        <label>{text(props.locale, "Kết thúc (giây)", "End (seconds)")}<input aria-label={text(props.locale, "Kết thúc", "End")} type="number" min={Math.min(duration, start + minimum)} max={duration} step="0.01" value={Number(end.toFixed(2))} onChange={(event) => updateEnd(Number(event.target.value))} /></label>
+      </div>
+    </div>
+    <div ref={trackRef} className={`waveform-track${isDragging ? " is-dragging" : ""}`} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag}>
       <canvas ref={canvasRef} />
-      <div className="trim-selection" style={{ left, width }} onPointerDown={(event) => { dragRef.current = "move"; event.currentTarget.setPointerCapture(event.pointerId); }}>
-        <button type="button" className="trim-handle start" aria-label="Trim start" onPointerDown={(event) => { event.stopPropagation(); dragRef.current = "start"; }} />
-        <button type="button" className="trim-handle end" aria-label="Trim end" onPointerDown={(event) => { event.stopPropagation(); dragRef.current = "end"; }} />
+      <div className="trim-playhead" style={{ left: playheadLeft }} aria-hidden="true" />
+      <div className="trim-selection" style={{ left, width }} onPointerDown={(event) => beginDrag(event, "move")}>
+        <button type="button" className="trim-handle start" aria-label="Trim start" onPointerDown={(event) => beginDrag(event, "start")} />
+        <button type="button" className="trim-handle end" aria-label="Trim end" onPointerDown={(event) => beginDrag(event, "end")} />
       </div>
     </div>
     {duration < 3 && <p className="trim-error">{text(props.locale, "Đoạn mẫu ngắn hơn 3 giây; hãy chọn file dài hơn để clone ổn định.", "The sample is shorter than 3 seconds; choose a longer file for a stable clone.")}</p>}
