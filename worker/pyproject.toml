@@ -16,7 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 omnivoice = ["omnivoice", "torch>=2.4"]
-dev = ["httpx>=0.28,<1", "pytest>=8,<9", "ruff>=0.12,<1"]
+# Pin the linter so local checks and GitHub Actions enforce the same rule set.
+dev = ["httpx>=0.28,<1", "pytest>=8,<9", "ruff==0.12.0"]
 
 [project.scripts]
 kova-voice-studio = "kova_voice_studio.api:main"

@@ -7,6 +7,15 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$isVerificationBuild = $env:KOVA_CI_VERIFY -eq '1'
+if ($isVerificationBuild) {
+    # A normal CI push must validate compilation without pretending to be a
+    # tagged release. The Wails binary remains in build/bin and is discarded
+    # with the runner; release builds still use the strict checks below.
+    Write-Output 'CI verification build: release packaging skipped.'
+    exit 0
+}
+
 $version = (Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw).Trim()
 
 Push-Location $projectRoot

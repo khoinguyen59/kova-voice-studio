@@ -2,6 +2,7 @@ name: Verify KOVA Voice Studio
 
 on:
   push:
+    branches: [master]
   pull_request:
 
 permissions:
@@ -9,7 +10,9 @@ permissions:
 
 jobs:
   desktop-core:
-    runs-on: ubuntu-latest
+    # Wails v2 links against WebKitGTK 4.0. Ubuntu 24.04 removed that package,
+    # while the supported 22.04 runner still provides the matching headers.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
