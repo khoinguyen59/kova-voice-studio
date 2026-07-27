@@ -21,6 +21,17 @@
   --amber: #b96d05;
   --red: #cf3154;
   --shadow: 0 18px 42px rgba(35, 89, 168, 0.11);
+  --hero-start: #ffffff;
+  --hero-middle: #f0f8ff;
+  --hero-end: #e8f7ff;
+  --hero-border: #cce3ff;
+  --hero-card: rgba(255, 255, 255, 0.7);
+  --soft-accent: #e8f4ff;
+  --soft-accent-hover: #eff8ff;
+  --soft-accent-strong: #dcedff;
+  --soft-track: #dfeafb;
+  --danger-surface: #fff2f5;
+  --danger-border: #f3b9c7;
   --wails-drop-target: drop;
 }
 
@@ -42,6 +53,17 @@
   --amber: #ffc86d;
   --red: #ff8298;
   --shadow: 0 20px 52px rgba(0, 0, 0, 0.28);
+  --hero-start: #0c2345;
+  --hero-middle: #102d56;
+  --hero-end: #0a3458;
+  --hero-border: #2a609e;
+  --hero-card: rgba(8, 29, 59, 0.82);
+  --soft-accent: #123561;
+  --soft-accent-hover: #173f70;
+  --soft-accent-strong: #194574;
+  --soft-track: #1b416f;
+  --danger-surface: #4a2033;
+  --danger-border: #8c3d59;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -63,6 +85,17 @@
     --amber: #ffc86d;
     --red: #ff8298;
     --shadow: 0 20px 52px rgba(0, 0, 0, 0.28);
+    --hero-start: #0c2345;
+    --hero-middle: #102d56;
+    --hero-end: #0a3458;
+    --hero-border: #2a609e;
+    --hero-card: rgba(8, 29, 59, 0.82);
+    --soft-accent: #123561;
+    --soft-accent-hover: #173f70;
+    --soft-accent-strong: #194574;
+    --soft-track: #1b416f;
+    --danger-surface: #4a2033;
+    --danger-border: #8c3d59;
   }
 }
 
@@ -227,3 +260,74 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .output-location{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 14px;padding:9px 0;border-bottom:1px solid #e0ebfb}.output-location small{overflow:hidden;color:#7285a8;text-overflow:ellipsis;white-space:nowrap}
 .transcript-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.transcript-confirm{margin-top:12px}@media(max-width:720px){.transcript-heading{align-items:stretch;flex-direction:column}.transcript-heading button{width:100%}}
 .separation-toggle{display:flex;flex:0 0 auto;align-items:center;gap:6px;color:var(--text);font-size:11px;font-weight:700;cursor:pointer}.separation-toggle input{width:16px;height:16px;margin:0;accent-color:var(--blue)}
+
+/* Theme-safe component surfaces. These areas used fixed light colors and
+   therefore ignored dark mode, producing large white panels. */
+.hero {
+  background: linear-gradient(118deg, var(--hero-start) 4%, var(--hero-middle) 55%, var(--hero-end) 100%);
+  border-color: var(--hero-border);
+}
+.hero::after {
+  border-color: color-mix(in srgb, var(--blue) 42%, transparent);
+  box-shadow: 0 0 0 32px color-mix(in srgb, var(--cyan) 9%, transparent), 0 0 0 72px color-mix(in srgb, var(--blue) 6%, transparent);
+}
+.voice-signature { background: var(--hero-card); border-color: color-mix(in srgb, var(--blue) 28%, var(--border)); }
+.signature-waveform { border-color: color-mix(in srgb, var(--border-strong) 64%, transparent); }
+.metric > span,
+.play-button,
+.document-chip,
+.count,
+.sample-toggle,
+.current-output > span,
+.audio-thumb,
+.task-status { background: var(--soft-accent); }
+.audio-art > span { background: var(--surface-solid); color: var(--blue); }
+.preset-button:hover,
+.preset-button.active,
+.gateway-mode button.active,
+.voice-card.selected { background: var(--soft-accent-hover); }
+.gateway-mode button.active { border-color: color-mix(in srgb, var(--blue) 30%, var(--border)); }
+.dropzone { background: linear-gradient(145deg, var(--surface-solid), var(--soft-accent)); border-color: color-mix(in srgb, var(--blue) 46%, var(--border)); }
+.dropzone:hover { background: var(--soft-accent-hover); }
+.drop-icon { background: var(--soft-accent-strong); }
+.sample-toggle { border-color: color-mix(in srgb, var(--blue) 38%, var(--border)); }
+.current-output { background: var(--soft-accent); border-color: color-mix(in srgb, var(--blue) 30%, var(--border)); }
+.progress-track { background: var(--soft-track); }
+.renderer-recovery pre { color: var(--red); background: var(--danger-surface); border-color: var(--danger-border); }
+
+.reference-trimmer,
+.reference-transcript,
+.emotion-control {
+  background: var(--surface-alt);
+  border-color: var(--border);
+}
+.reference-trimmer p,
+.emotion-control p,
+.trim-time-grid label,
+.emotion-control details,
+.output-location small { color: var(--muted); }
+.waveform-track { background: var(--input); border-color: var(--border); }
+.trim-selection { border-color: var(--blue); background: color-mix(in srgb, var(--blue) 18%, transparent); }
+.trim-handle { background: var(--blue); }
+.trim-playhead { box-shadow: 0 0 0 1px var(--surface-solid); }
+.reference-transcript small,
+.trim-error { color: var(--red); }
+.trim-warning { color: var(--amber) !important; }
+.output-location { border-color: var(--border); }
+
+/* Worker feedback distinguishes a connection, model warm-up, and a busy GPU. */
+.connection.warming { color: var(--blue); }
+.connection.warming i { background: var(--blue); box-shadow: 0 0 0 4px color-mix(in srgb, var(--blue) 13%, transparent); }
+.connection.busy { color: var(--amber); }
+.connection.busy i { background: var(--amber); box-shadow: 0 0 0 4px color-mix(in srgb, var(--amber) 13%, transparent); }
+.connection.ready { color: var(--green); }
+.connection.ready i { background: var(--green); box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 13%, transparent); }
+.status-badge.warming { color: var(--blue); background: color-mix(in srgb, var(--blue) 10%, var(--surface-alt)); }
+.status-badge.busy { color: var(--amber); background: color-mix(in srgb, var(--amber) 10%, var(--surface-alt)); }
+.worker-context { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 14px 0 0; padding: 10px 12px; background: var(--surface-alt); border: 1px solid var(--border); border-radius: 12px; }
+.worker-context p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; text-align: right; }
+
+@media (max-width: 720px) {
+  .worker-context { align-items: flex-start; flex-direction: column; }
+  .worker-context p { text-align: left; }
+}

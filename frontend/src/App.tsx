@@ -167,6 +167,43 @@ const formatElapsed = (milliseconds: number) => {
   return `${remainingSeconds} giây`;
 };
 
+const workerState = (health: Health | null, locale: "vi" | "en") => {
+  if (!health?.reachable) {
+    return {
+      tone: "idle",
+      label: text(locale, "Chưa kết nối worker", "Worker not connected"),
+      metric: "—",
+    };
+  }
+  if (health.busy) {
+    return {
+      tone: "busy",
+      label: text(
+        locale,
+        `GPU đang bận${health.queue_depth ? ` · ${health.queue_depth} chờ` : ""}`,
+        `GPU busy${health.queue_depth ? ` · ${health.queue_depth} queued` : ""}`,
+      ),
+      metric: text(locale, "Đang bận", "Busy"),
+    };
+  }
+  if (health.ready) {
+    return {
+      tone: "ready",
+      label: text(locale, "Worker sẵn sàng", "Worker ready"),
+      metric: text(locale, "Sẵn sàng", "Ready"),
+    };
+  }
+  return {
+    tone: "warming",
+    label: text(
+      locale,
+      "Đã kết nối · tự tải model khi chạy",
+      "Connected · loads model on first task",
+    ),
+    metric: text(locale, "Đã kết nối", "Connected"),
+  };
+};
+
 export default function App() {
   const [data, setData] = useState<Bootstrap>(blankBootstrap);
   const [page, setPage] = useState<Page>("home");
@@ -225,6 +262,7 @@ export default function App() {
     emotionPresets[0] ??
     null;
   const selected = savedVoices.find((voice) => voice.id === selectedID) ?? null;
+  const currentWorkerState = workerState(health, locale);
 
   useEffect(() => {
     if (loaded) return;
@@ -912,11 +950,9 @@ export default function App() {
             <h1>{text(locale, labels[page][0], labels[page][1])}</h1>
           </div>
           <div className="topbar-actions">
-            <span className={`connection ${health?.reachable ? "good" : ""}`}>
+            <span className={`connection ${currentWorkerState.tone}`}>
               <i />
-              {health?.reachable
-                ? text(locale, "Worker sẵn sàng", "Worker ready")
-                : text(locale, "Chưa kết nối worker", "Worker not connected")}
+              {currentWorkerState.label}
             </span>
             <select
               aria-label="Language"
@@ -1192,6 +1228,7 @@ function HomePage(props: {
     health,
     busy,
   } = props;
+  const currentWorkerState = workerState(health, locale);
   return (
     <div className="page-grid home-page">
       <section className="hero panel">
@@ -1287,7 +1324,7 @@ function HomePage(props: {
         />
         <Metric
           label={text(locale, "Trạng thái GPU", "GPU status")}
-          value={health?.reachable ? "Online" : "—"}
+          value={currentWorkerState.metric}
           icon="⌁"
         />
       </section>
@@ -1306,13 +1343,20 @@ function HomePage(props: {
             </h3>
           </div>
           <span
-            className={`status-badge ${health?.reachable ? "ready" : "idle"}`}
+            className={`status-badge ${currentWorkerState.tone}`}
           >
-            {health?.reachable
-              ? text(locale, "Sẵn sàng", "Ready")
-              : text(locale, "Cần kết nối", "Connect")}
+            {currentWorkerState.label}
           </span>
         </div>
+        {health?.reachable && (
+          <div className="worker-context" role="status">
+            <span className={`connection ${currentWorkerState.tone}`}>
+              <i />
+              {currentWorkerState.label}
+            </span>
+            <p>{health.message}{health.device ? ` · ${health.device}` : ""}</p>
+          </div>
+        )}
         <div className="notice info automatic-pairing-notice">
           {text(
             locale,
@@ -1320,7 +1364,7 @@ function HomePage(props: {
             "Manual connection: Run all in Colab, then paste KOVA_VOICE_URL and KOVA_VOICE_TOKEN from the final cell below. The token is session-only.",
           )}
         </div>
-        <details className="manual-worker-config" open>
+        <details className="manual-worker-config" open={!health?.reachable}>
           <summary>
             {text(
               locale,
