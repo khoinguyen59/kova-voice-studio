@@ -18,6 +18,18 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: '1.24.x'
+      # The desktop binary embeds frontend/dist, so Go vet and race tests need
+      # the production frontend generated in this job's isolated workspace.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build embedded frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
       # Wails imports the native WebKit bridge even though unit tests do not
       # launch a desktop window; install the headers so race tests compile.
       - run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
