@@ -315,6 +315,56 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .trim-warning { color: var(--amber) !important; }
 .output-location { border-color: var(--border); }
 
+/* Dark-mode contrast contract.  Keep browser-owned controls in the same
+   palette and explicitly cover every previously light-only interactive state.
+   This guard is intentionally last: a future component cannot make a large
+   white surface reappear in the dark executable by winning on source order. */
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="dark"] .metric > span,
+:root[data-theme="dark"] .play-button,
+:root[data-theme="dark"] .document-chip,
+:root[data-theme="dark"] .count,
+:root[data-theme="dark"] .sample-toggle,
+:root[data-theme="dark"] .current-output > span,
+:root[data-theme="dark"] .audio-thumb,
+:root[data-theme="dark"] .task-status { background: var(--soft-accent); }
+:root[data-theme="dark"] .preset-button:hover,
+:root[data-theme="dark"] .preset-button.active,
+:root[data-theme="dark"] .gateway-mode button.active,
+:root[data-theme="dark"] .voice-card.selected,
+:root[data-theme="dark"] .dropzone:hover { background: var(--soft-accent-hover); }
+:root[data-theme="dark"] .hero,
+:root[data-theme="dark"] .voice-signature,
+:root[data-theme="dark"] .dropzone,
+:root[data-theme="dark"] .reference-trimmer,
+:root[data-theme="dark"] .reference-transcript,
+:root[data-theme="dark"] .emotion-control,
+:root[data-theme="dark"] .current-output { color: var(--text); }
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] { color-scheme: dark; }
+  :root[data-theme="system"] .metric > span,
+  :root[data-theme="system"] .play-button,
+  :root[data-theme="system"] .document-chip,
+  :root[data-theme="system"] .count,
+  :root[data-theme="system"] .sample-toggle,
+  :root[data-theme="system"] .current-output > span,
+  :root[data-theme="system"] .audio-thumb,
+  :root[data-theme="system"] .task-status { background: var(--soft-accent); }
+  :root[data-theme="system"] .preset-button:hover,
+  :root[data-theme="system"] .preset-button.active,
+  :root[data-theme="system"] .gateway-mode button.active,
+  :root[data-theme="system"] .voice-card.selected,
+  :root[data-theme="system"] .dropzone:hover { background: var(--soft-accent-hover); }
+  :root[data-theme="system"] .hero,
+  :root[data-theme="system"] .voice-signature,
+  :root[data-theme="system"] .dropzone,
+  :root[data-theme="system"] .reference-trimmer,
+  :root[data-theme="system"] .reference-transcript,
+  :root[data-theme="system"] .emotion-control,
+  :root[data-theme="system"] .current-output { color: var(--text); }
+}
+
 /* Worker feedback distinguishes a connection, model warm-up, and a busy GPU. */
 .connection.warming { color: var(--blue); }
 .connection.warming i { background: var(--blue); box-shadow: 0 0 0 4px color-mix(in srgb, var(--blue) 13%, transparent); }

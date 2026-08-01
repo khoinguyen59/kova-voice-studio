@@ -59,7 +59,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     store = ProfileStore(path)
     work_root = path.parent
     jobs = JobQueue(store, work_root / "jobs")
-    app = FastAPI(title="KOVA Voice Studio", version="1.0.2.1")
+    app = FastAPI(title="KOVA Voice Studio", version="1.0.2.2")
     app.state.profile_store = store
     app.state.job_queue = jobs
     pairing_lock = Lock()
