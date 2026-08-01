@@ -8,17 +8,17 @@ export function AutoTranscribeReference(arg1:main.ReferenceTranscriptRequest):Pr
 
 export function Bootstrap():Promise<main.StudioBootstrap>;
 
-export function CheckWorker(arg1:main.WorkerSession):Promise<main.WorkerHealth>;
-
 export function CancelWorkerJob(arg1:main.WorkerSession,arg2:string):Promise<void>;
 
+export function CheckWorker(arg1:main.WorkerSession):Promise<main.WorkerHealth>;
+
 export function CreateVoice(arg1:main.VoiceCreateRequest):Promise<main.VoiceProfile>;
+
+export function DebugLogLocation():Promise<string>;
 
 export function DeleteHistory(arg1:string):Promise<Array<main.GenerationHistory>>;
 
 export function DeleteVoice(arg1:main.WorkerSession,arg2:string):Promise<Array<main.VoiceProfile>>;
-
-export function DebugLogLocation():Promise<string>;
 
 export function GenerateVoice(arg1:main.GenerateRequest):Promise<main.GenerationResult>;
 

@@ -14,16 +14,20 @@ export function Bootstrap() {
   return window['go']['main']['App']['Bootstrap']();
 }
 
-export function CheckWorker(arg1) {
-  return window['go']['main']['App']['CheckWorker'](arg1);
-}
-
 export function CancelWorkerJob(arg1, arg2) {
   return window['go']['main']['App']['CancelWorkerJob'](arg1, arg2);
 }
 
+export function CheckWorker(arg1) {
+  return window['go']['main']['App']['CheckWorker'](arg1);
+}
+
 export function CreateVoice(arg1) {
   return window['go']['main']['App']['CreateVoice'](arg1);
+}
+
+export function DebugLogLocation() {
+  return window['go']['main']['App']['DebugLogLocation']();
 }
 
 export function DeleteHistory(arg1) {
@@ -32,10 +36,6 @@ export function DeleteHistory(arg1) {
 
 export function DeleteVoice(arg1, arg2) {
   return window['go']['main']['App']['DeleteVoice'](arg1, arg2);
-}
-
-export function DebugLogLocation() {
-  return window['go']['main']['App']['DebugLogLocation']();
 }
 
 export function GenerateVoice(arg1) {

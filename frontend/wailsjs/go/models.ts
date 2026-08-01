@@ -30,11 +30,11 @@ export namespace main {
 	    label_en: string;
 	    instruct: string;
 	    tokens: string[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new EmotionPreset(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -51,11 +51,11 @@ export namespace main {
 	    text: string;
 	    language: string;
 	    emotion_id: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new EmotionTextRequest(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.gateway_url = source["gateway_url"];
@@ -228,11 +228,11 @@ export namespace main {
 	    reference_path: string;
 	    reference_data_url: string;
 	    language: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ReferenceTranscriptRequest(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.base_url = source["base_url"];
@@ -431,3 +431,4 @@ export namespace main {
 	}
 
 }
+
